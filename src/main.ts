@@ -201,6 +201,54 @@ function renderSuccess(message: string): void {
   }
 }
 
+// 刷新单个股票/期权价格
+async function refreshSingleStock(symbol: string): Promise<void> {
+  const stock = state.stocks.find(s => s.symbol === symbol);
+  if (!stock) return;
+  
+  const btn = document.querySelector(`#price-${symbol} button`) as HTMLButtonElement;
+  if (btn) {
+    btn.textContent = '⏳';
+    btn.disabled = true;
+  }
+  
+  try {
+    const data = await fetchStockDataFromAPI(symbol);
+    
+    state.stocks = state.stocks.map(s => {
+      if (s.symbol === symbol) {
+        return {
+          ...s,
+          currentPrice: data.price,
+          change: data.change,
+          changePercent: data.changePercent,
+          position: s.shares * data.price
+        };
+      }
+      return s;
+    });
+    
+    calculateTotals();
+    
+    // 只更新价格单元格
+    const priceEl = document.getElementById(`price-${symbol}`);
+    if (priceEl) {
+      const changeSign = data.change >= 0 ? '+' : '';
+      priceEl.innerHTML = `<span style="color: ${data.change >= 0 ? '#059669' : '#ef4444'}">$${data.price.toFixed(2)}</span> <span style="font-size: 0.7rem; color: #666;">(${changeSign}${data.change.toFixed(2)})</span>
+        <button onclick="refreshSingleStock('${symbol}')" style="margin-left: 4px; padding: 2px 6px; font-size: 0.7rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer;">↻</button>`;
+    }
+    
+  } catch (error) {
+    console.error(`刷新 ${symbol} 数据失败:`, error);
+    renderError(`刷新 ${symbol} 失败`);
+    
+    if (btn) {
+      btn.textContent = '↻';
+      btn.disabled = false;
+    }
+  }
+}
+
 // 函数：从后端 API 获取股票数据 (Finnhub)
 async function fetchStockDataFromAPI(symbol: string): Promise<StockData> {
   try {
@@ -740,7 +788,13 @@ function render(): void {
                              style="width: 80px; padding: 6px; border: 1px solid #e5e7eb; border-radius: 6px; text-align: center;"
                              step="0.01" min="0" />
                     </td>
-                    <td style="font-weight: 600;">$${formatNumber(stock.currentPrice)}</td>
+                    <td style="font-weight: 600;">
+                      <span id="price-${stock.symbol}">$${formatNumber(stock.currentPrice)}</span>
+                      <button onclick="refreshSingleStock('${stock.symbol}')" 
+                              style="margin-left: 4px; padding: 2px 6px; font-size: 0.7rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer;">
+                        ↻
+                      </button>
+                    </td>
                     <td style="font-weight: 600; color: #059669;">$${formatNumber(stock.position)}</td>
                     <td style="font-weight: 600; color: #667eea;">${formatPercent(stock.weight)}</td>
                     <td>
