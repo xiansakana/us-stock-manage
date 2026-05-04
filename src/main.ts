@@ -293,9 +293,12 @@ async function fetchBatchStockData(symbols: string[]): Promise<any[]> {
 
 // 函数：计算总计
 function calculateTotals(): void {
-  // 计算股票总市值
+  // 计算股票总市值（期权需要 × 100）
   const stocksValue = state.stocks.reduce((sum, stock) => {
-    return sum + (stock.shares * stock.currentPrice);
+    // 期权：股数 × 现价 × 100（每个期权合约 = 100股）
+    // 股票：股数 × 现价
+    const multiplier = stock.type === 'option' ? 100 : 1;
+    return sum + (stock.shares * stock.currentPrice * multiplier);
   }, 0);
   
   // 总资产 = 股票市值 + 现金
@@ -303,7 +306,10 @@ function calculateTotals(): void {
   state.totalValue = stocksValue;
   
   state.stocks = state.stocks.map(stock => {
-    const position = stock.shares * stock.currentPrice;
+    // 期权：股数 × 现价 × 100
+    // 股票：股数 × 现价
+    const multiplier = stock.type === 'option' ? 100 : 1;
+    const position = stock.shares * stock.currentPrice * multiplier;
     const weight = totalAssets > 0 ? (position / totalAssets) * 100 : 0;
     return {
       ...stock,
@@ -413,7 +419,8 @@ function importFromJSON(event: Event): void {
       if (data.stocks && Array.isArray(data.stocks)) {
         state.stocks = data.stocks.map(s => ({
           ...s,
-          position: s.shares * s.currentPrice,
+          // 期权：股数 × 现价 × 100
+          position: s.shares * s.currentPrice * (s.type === 'option' ? 100 : 1),
           weight: 0
         }));
         state.cash = data.cash || 0;
@@ -756,6 +763,31 @@ function render(): void {
               </label>
             </div>
           </div>
+          <div class="summary" style="margin-bottom: 20px;">
+            <div class="summary-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+              <h3>总资产</h3>
+              <div class="value">$${formatNumber(state.totalValue + state.cash)}</div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+              <h3>股票市值</h3>
+              <div class="value">$${formatNumber(state.stocks.filter(s => s.type !== 'option').reduce((sum, s) => sum + s.position, 0))}</div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
+              <h3>期权市值</h3>
+              <div class="value">$${formatNumber(state.stocks.filter(s => s.type === 'option').reduce((sum, s) => sum + s.position, 0))}</div>
+            </div>
+            <div class="summary-card">
+              <h3>现金</h3>
+              <div class="value" style="display: flex; align-items: center; gap: 4px;">
+                <span style="font-size: 0.9rem;">$</span>
+                <input type="number" value="${state.cash}" 
+                       onchange="updateCash(parseFloat(this.value) || 0)" 
+                       style="width: 90px; padding: 4px 6px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.15); color: white; font-size: 1.1rem; font-weight: 600;"
+                       step="0.01" min="0" />
+              </div>
+            </div>
+          </div>
+          
           <div class="table-container">
             <table>
               <thead>
@@ -817,27 +849,6 @@ function render(): void {
                 `).join('')}
               </tbody>
             </table>
-          </div>
-          
-          <div class="summary">
-            <div class="summary-card">
-              <h3>现金</h3>
-              <div class="value" style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-size: 0.9rem;">$</span>
-                <input type="number" value="${state.cash}" 
-                       onchange="updateCash(parseFloat(this.value) || 0)" 
-                       style="width: 100px; padding: 4px 8px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.1); color: white; font-size: 1.2rem; font-weight: 600;"
-                       step="0.01" min="0" />
-              </div>
-            </div>
-            <div class="summary-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
-              <h3>股票市值</h3>
-              <div class="value">$${formatNumber(state.totalValue)}</div>
-            </div>
-            <div class="summary-card" style="background: linear-gradient(135deg, #059669 0%, #10b981 100%);">
-              <h3>总资产</h3>
-              <div class="value">$${formatNumber(state.totalValue + state.cash)}</div>
-            </div>
           </div>
         `}
       </div>
