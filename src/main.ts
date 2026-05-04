@@ -36,32 +36,102 @@ const state: AppState = {
 const ALPHA_VANTAGE_API = 'https://www.alphavantage.co/query';
 const ALPHA_VANTAGE_API_KEY = 'DU6YOC69XS1OR37G';
 
-// 股票名称映射
+// 股票名称映射 (完整的常用美股代码)
 const STOCK_NAMES: Record<string, string> = {
+  // 科技巨头
   'AAPL': 'Apple Inc.',
-  'GOOGL': 'Alphabet Inc.',
+  'GOOGL': 'Alphabet Inc. Class A',
+  'GOOG': 'Alphabet Inc. Class C',
   'MSFT': 'Microsoft Corporation',
   'AMZN': 'Amazon.com Inc.',
   'META': 'Meta Platforms Inc.',
   'TSLA': 'Tesla Inc.',
   'NVDA': 'NVIDIA Corporation',
-  'JPM': 'JPMorgan Chase & Co.',
-  'V': 'Visa Inc.',
-  'JNJ': 'Johnson & Johnson',
-  'WMT': 'Walmart Inc.',
-  'PG': 'Procter & Gamble Co.',
-  'MA': 'Mastercard Inc.',
-  'UNH': 'UnitedHealth Group Inc.',
-  'HD': 'The Home Depot Inc.',
-  'DIS': 'The Walt Disney Company',
+  
+  // 半导体
+  'AMD': 'Advanced Micro Devices',
+  'INTC': 'Intel Corporation',
+  'QCOM': 'Qualcomm Inc.',
+  'TXN': 'Texas Instruments',
+  'AVGO': 'Broadcom Inc.',
+  'MU': 'Micron Technology',
+  
+  // 互联网
   'NFLX': 'Netflix Inc.',
   'PYPL': 'PayPal Holdings Inc.',
-  'ADBE': 'Adobe Inc.',
-  'CRM': 'Salesforce Inc.',
-  'NKE': 'Nike Inc.',
-  'BULL': 'Bull',
+  'SHOP': 'Shopify Inc.',
+  'SQ': 'Block Inc.',
+  'SNAP': 'Snap Inc.',
+  'TWTR': 'Twitter Inc.',
+  'PINS': 'Pinterest Inc.',
+  'ROKU': 'Roku Inc.',
+  
+  // 金融
+  'JPM': 'JPMorgan Chase & Co.',
+  'BAC': 'Bank of America Corp.',
+  'WFC': 'Wells Fargo & Co.',
+  'GS': 'Goldman Sachs Group',
+  'MS': 'Morgan Stanley',
+  'V': 'Visa Inc.',
+  'MA': 'Mastercard Inc.',
+  'AXP': 'American Express Co.',
   'BX': 'Blackstone Inc.',
-  'SOFI': 'SoFi Technologies Inc.'
+  
+  // 消费
+  'WMT': 'Walmart Inc.',
+  'TGT': 'Target Corporation',
+  'COST': 'Costco Wholesale',
+  'HD': 'The Home Depot Inc.',
+  'LOW': "Lowe's Companies",
+  'NKE': 'Nike Inc.',
+  'SBUX': 'Starbucks Corporation',
+  'MCD': "McDonald's Corporation",
+  'DIS': 'The Walt Disney Company',
+  
+  // 医疗健康
+  'JNJ': 'Johnson & Johnson',
+  'UNH': 'UnitedHealth Group Inc.',
+  'PFE': 'Pfizer Inc.',
+  'ABBV': 'AbbVie Inc.',
+  'MRK': 'Merck & Co.',
+  'LLY': 'Eli Lilly and Company',
+  'ABT': 'Abbott Laboratories',
+  'TMO': 'Thermo Fisher Scientific',
+  'DHR': 'Danaher Corporation',
+  'AMGN': 'Amgen Inc.',
+  
+  // 工业
+  'BA': 'Boeing Company',
+  'CAT': 'Caterpillar Inc.',
+  'GE': 'General Electric',
+  'HON': 'Honeywell International',
+  'UPS': 'United Parcel Service',
+  'FDX': 'FedEx Corporation',
+  
+  // 能源
+  'XOM': 'Exxon Mobil Corporation',
+  'CVX': 'Chevron Corporation',
+  'COP': 'ConocoPhillips',
+  
+  // 电信
+  'T': 'AT&T Inc.',
+  'VZ': 'Verizon Communications',
+  'TMUS': 'T-Mobile US Inc.',
+  
+  // 电商/零售
+  'BABA': 'Alibaba Group',
+  'JD': 'JD.com Inc.',
+  'EBAY': 'eBay Inc.',
+  'ETSY': 'Etsy Inc.',
+  
+  // 其他热门
+  'SOFI': 'SoFi Technologies Inc.',
+  'SOXX': 'iShares Semiconductor ETF',
+  'BULL': 'Bull (3x Long)',
+  'SPY': 'SPDR S&P 500 ETF Trust',
+  'QQQ': 'Invesco QQQ Trust',
+  'DIA': 'SPDR Dow Jones ETF',
+  'IWM': 'iShares Russell 2000 ETF'
 };
 
 // 工具函数：格式化数字
@@ -362,9 +432,10 @@ function render(): void {
       
       <div class="card">
         <div class="input-section">
-          <div class="input-group">
+          <div class="input-group" style="position: relative;">
             <label for="symbol">股票代码</label>
-            <input type="text" id="symbol" placeholder="例如: AAPL" ${state.loading ? 'disabled' : ''} />
+            <input type="text" id="symbol" placeholder="输入股票代码搜索..." autocomplete="off" ${state.loading ? 'disabled' : ''} />
+            <div id="stock-suggestions" class="suggestions-dropdown"></div>
           </div>
           <div class="input-group">
             <label for="shares">股数</label>
@@ -455,12 +526,18 @@ function render(): void {
   
   // 自动保存
   saveToStorage();
+  
+  // 每次渲染后重新设置下拉搜索事件
+  setupStockSearchEvents();
 }
 
 // 初始化应用
 function init(): void {
   loadFromStorage();
   render();
+  
+  // 设置下拉搜索事件
+  setupStockSearchEvents();
   
   // 页面加载时自动更新价格
   if (state.stocks.length > 0) {
@@ -476,3 +553,132 @@ init();
 (window as any).removeStock = removeStock;
 (window as any).updateStock = updateStock;
 (window as any).updateStockPrices = updateStockPrices;
+(window as any).selectStock = selectStock;
+
+// 下拉搜索相关变量
+let selectedIndex = -1;
+
+// 函数：过滤股票
+function filterStocks(query: string): Array<{symbol: string; name: string}> {
+  if (!query.trim()) return [];
+  
+  const upperQuery = query.toUpperCase();
+  const lowerQuery = query.toLowerCase();
+  
+  return Object.entries(STOCK_NAMES)
+    .filter(([symbol, name]) => {
+      return symbol.includes(upperQuery) || name.toLowerCase().includes(lowerQuery);
+    })
+    .slice(0, 10) // 最多显示10个结果
+    .map(([symbol, name]) => ({ symbol, name }));
+}
+
+// 函数：显示下拉建议
+function showSuggestions(suggestions: Array<{symbol: string; name: string}>): void {
+  const dropdown = document.getElementById('stock-suggestions');
+  if (!dropdown) return;
+  
+  if (suggestions.length === 0) {
+    dropdown.innerHTML = '<div class="no-results">未找到匹配的股票</div>';
+    dropdown.style.display = 'block';
+    return;
+  }
+  
+  dropdown.innerHTML = suggestions.map((item, index) => `
+    <div class="suggestion-item ${index === selectedIndex ? 'selected' : ''}" 
+         onclick="selectStock('${item.symbol}')"
+         onmouseenter="highlightSuggestion(${index})">
+      <span class="suggestion-symbol">${item.symbol}</span>
+      <span class="suggestion-name">${item.name}</span>
+    </div>
+  `).join('');
+  
+  dropdown.style.display = 'block';
+  selectedIndex = -1;
+}
+
+// 函数：隐藏下拉建议
+function hideSuggestions(): void {
+  const dropdown = document.getElementById('stock-suggestions');
+  if (dropdown) {
+    dropdown.style.display = 'none';
+  }
+  selectedIndex = -1;
+}
+
+// 函数：高亮建议项
+function highlightSuggestion(index: number): void {
+  const items = document.querySelectorAll('.suggestion-item');
+  items.forEach((item, i) => {
+    (item as HTMLElement).classList.toggle('selected', i === index);
+  });
+  selectedIndex = index;
+}
+
+// 函数：选择股票
+function selectStock(symbol: string): void {
+  const input = document.getElementById('symbol') as HTMLInputElement;
+  if (input) {
+    input.value = symbol;
+  }
+  hideSuggestions();
+  
+  // 聚焦到股数输入框
+  const sharesInput = document.getElementById('shares') as HTMLInputElement;
+  if (sharesInput) {
+    sharesInput.focus();
+  }
+}
+
+// 函数：设置下拉搜索事件
+function setupStockSearchEvents(): void {
+  const input = document.getElementById('symbol') as HTMLInputElement;
+  const dropdown = document.getElementById('stock-suggestions');
+  
+  if (!input || !dropdown) return;
+  
+  // 输入事件
+  input.addEventListener('input', (e) => {
+    const value = (e.target as HTMLInputElement).value;
+    const suggestions = filterStocks(value);
+    showSuggestions(suggestions);
+  });
+  
+  // 聚焦事件
+  input.addEventListener('focus', () => {
+    const value = input.value;
+    if (value) {
+      const suggestions = filterStocks(value);
+      showSuggestions(suggestions);
+    }
+  });
+  
+  // 键盘导航
+  input.addEventListener('keydown', (e) => {
+    const suggestions = filterStocks(input.value);
+    if (suggestions.length === 0) return;
+    
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      selectedIndex = Math.min(selectedIndex + 1, suggestions.length - 1);
+      highlightSuggestion(selectedIndex);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      selectedIndex = Math.max(selectedIndex - 1, 0);
+      highlightSuggestion(selectedIndex);
+    } else if (e.key === 'Enter' && selectedIndex >= 0) {
+      e.preventDefault();
+      selectStock(suggestions[selectedIndex].symbol);
+    } else if (e.key === 'Escape') {
+      hideSuggestions();
+    }
+  });
+  
+  // 点击外部关闭
+  document.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement;
+    if (!target.closest('.input-group')) {
+      hideSuggestions();
+    }
+  });
+}
