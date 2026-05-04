@@ -297,6 +297,43 @@ tbody tr:nth-child(even):hover {
   color: #6b7280;
 }
 
+/* 期权相关样式 */
+.option-item {
+  background: rgba(102, 126, 234, 0.05);
+}
+
+.option-badge {
+  background: #667eea;
+  color: white;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  margin-left: 8px;
+}
+
+.suggestion-item.option-item .suggestion-symbol {
+  color: #764ba2;
+}
+
+/* 响应式调整 */
+@media (max-width: 768px) {
+  .input-section {
+    flex-direction: column;
+  }
+  
+  .input-group {
+    min-width: 100%;
+  }
+  
+  table {
+    font-size: 0.85rem;
+  }
+  
+  th, td {
+    padding: 10px 8px;
+  }
+}
+
 .empty-state p {
   margin: 0;
 }
