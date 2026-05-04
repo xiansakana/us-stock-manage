@@ -9,12 +9,13 @@ interface Stock {
   weight: number;
 }
 
-interface AlphaVantageGlobalQuote {
-  'Global Quote': {
-    '05. price': string;
-    '09. change': string;
-    '10. change percent': string;
-  };
+// 股票数据接口 (来自后端 API)
+interface StockData {
+  symbol: string;
+  name: string;
+  price: number;
+  change: number;
+  changePercent: number;
 }
 
 interface AppState {
@@ -188,53 +189,17 @@ function renderSuccess(message: string): void {
   }
 }
 
-// 函数：从 Alpha Vantage 获取股票数据
-async function fetchStockDataFromAlphaVantage(symbol: string): Promise<any> {
+// 函数：从后端 API 获取股票数据 (Finnhub)
+async function fetchStockDataFromAPI(symbol: string): Promise<StockData> {
   try {
-    // 获取实时报价
-    const quoteUrl = `${ALPHA_VANTAGE_API}?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(symbol)}&apikey=${ALPHA_VANTAGE_API_KEY}`;
-    const quoteResponse = await fetch(quoteUrl);
+    const response = await fetch(`/api/stock/${encodeURIComponent(symbol)}`);
     
-    if (!quoteResponse.ok) {
-      throw new Error(`HTTP ${quoteResponse.status}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
     
-    const quoteData: AlphaVantageGlobalQuote = await quoteResponse.json();
-    
-    if (!quoteData['Global Quote'] || !quoteData['Global Quote']['05. price']) {
-      throw new Error('无法获取股票数据');
-    }
-    
-    const globalQuote = quoteData['Global Quote'];
-    const price = parseFloat(globalQuote['05. price']) || 0;
-    const change = parseFloat(globalQuote['09. change']) || 0;
-    const changePercentStr = globalQuote['10. change percent'].replace('%', '');
-    const changePercent = parseFloat(changePercentStr) || 0;
-    
-    // 获取公司名称 (需要额外的 API 调用)
-    let companyName = STOCK_NAMES[symbol.toUpperCase()] || symbol.toUpperCase();
-    
-    try {
-      const overviewUrl = `${ALPHA_VANTAGE_API}?function=OVERVIEW&symbol=${encodeURIComponent(symbol)}&apikey=${ALPHA_VANTAGE_API_KEY}`;
-      const overviewResponse = await fetch(overviewUrl);
-      
-      if (overviewResponse.ok) {
-        const overviewData = await overviewResponse.json();
-        if (overviewData.Name) {
-          companyName = overviewData.Name;
-        }
-      }
-    } catch (nameError) {
-      console.warn(`获取 ${symbol} 公司名称失败，使用默认名称`);
-    }
-    
-    return {
-      symbol: symbol.toUpperCase(),
-      name: companyName,
-      price: price,
-      change: change,
-      changePercent: changePercent
-    };
+    const data: StockData = await response.json();
+    return data;
   } catch (error) {
     console.error('获取股票数据失败:', error);
     throw error;
@@ -247,7 +212,7 @@ async function fetchBatchStockData(symbols: string[]): Promise<any[]> {
   
   for (const symbol of symbols) {
     try {
-      const data = await fetchStockDataFromAlphaVantage(symbol);
+      const data = await fetchStockDataFromAPI(symbol);
       results.push(data);
       // 添加延迟以遵守 API rate limit (每分钟 5 次请求)
       await new Promise(resolve => setTimeout(resolve, 13000));
@@ -388,7 +353,7 @@ async function addStock(): Promise<void> {
   render();
   
   try {
-    const stockData = await fetchStockDataFromAlphaVantage(symbol);
+    const stockData = await fetchStockDataFromAPI(symbol);
     
     const newStock: Stock = {
       symbol,
