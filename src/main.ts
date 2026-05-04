@@ -561,9 +561,30 @@ async function addStock(): Promise<void> {
     let stockData: StockData;
     
     if (isOption) {
-      // 期权：使用标的股票价格
-      const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
-      stockData = await fetchStockDataFromAPI(underlying);
+      // 期权：使用 Polygon.io API 获取期权价格
+      try {
+        const response = await fetch(`/api/option/${encodeURIComponent(symbol)}`);
+        if (response.ok) {
+          const optionData = await response.json();
+          stockData = {
+            symbol: optionData.symbol,
+            name: optionData.name,
+            price: optionData.price,
+            change: optionData.change,
+            changePercent: optionData.changePercent
+          };
+        } else {
+          // 如果期权数据获取失败，使用标的股票价格作为参考
+          const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
+          stockData = await fetchStockDataFromAPI(underlying);
+          stockData.name = `${STOCK_NAMES[underlying] || underlying} 期权`;
+        }
+      } catch {
+        // 获取期权数据失败，使用标的股票价格
+        const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
+        stockData = await fetchStockDataFromAPI(underlying);
+        stockData.name = `${STOCK_NAMES[underlying] || underlying} 期权`;
+      }
     } else {
       stockData = await fetchStockDataFromAPI(symbol);
     }
