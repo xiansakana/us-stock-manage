@@ -51,10 +51,10 @@ function toPolygonOptionSymbol(symbol: string): string {
   if (!parsed) return '';
   
   // Polygon.io 格式: O:AAPL250530C00150000
-  // 执行价格式：3位整数 + 3位小数 = 6位数字，左补零到8位
-  // 例如: $150 = 150000 -> 00150000 (左补零到8位)
+  // 执行价格式：strike * 1000 (3位小数)，左补零到8位
+  // 例如: $150 = 150000 -> 00150000
   const strikeFloat = parseFloat(parsed.strike);
-  const strikeInt = Math.round(strikeFloat * 1000); // 3位小数
+  const strikeInt = Math.round(strikeFloat * 1000); // 3位小数精度
   const strikePadded = strikeInt.toString().padStart(8, '0');
   return `O:${parsed.underlying}${parsed.expiration}${parsed.type}${strikePadded}`;
 }
@@ -108,7 +108,7 @@ router.get('/stock/:symbol', async (req, res) => {
   }
 });
 
-// 获取期权数据 (Polygon.io)
+// 获取期权数据 (Polygon.io v3 API)
 router.get('/option/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -124,38 +124,46 @@ router.get('/option/:symbol', async (req, res) => {
     
     const polygonSymbol = toPolygonOptionSymbol(upperSymbol);
     
-    // 使用 Polygon.io 获取上一个交易日的数据
-    const url = `https://api.polygon.io/v2/aggs/ticker/${polygonSymbol}/prev?apiKey=${POLYGON_API_KEY}`;
-    const response = await fetch(url);
+    // 首先使用 v3/reference/options/contracts 获取期权合约详情
+    const contractUrl = `https://api.polygon.io/v3/reference/options/contracts/${polygonSymbol}?apiKey=${POLYGON_API_KEY}`;
+    const contractResponse = await fetch(contractUrl);
+    const contractData = await contractResponse.json();
     
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    
-    if (data.status !== 'OK' || !data.results || data.results.length === 0) {
+    // 如果合约不存在，返回错误
+    if (contractData.status !== 'OK' || !contractData.results) {
       return res.status(404).json({
-        error: '无法获取期权数据，期权代码可能不存在或已过期',
+        error: '期权代码不存在或已过期',
         symbol: upperSymbol,
-        polygonSymbol: polygonSymbol
+        polygonSymbol: polygonSymbol,
+        hint: '请检查期权代码是否正确，或尝试更新的到期日'
       });
     }
     
-    const result = data.results[0];
+    // 使用 v2/aggs 获取上一个交易日的价格数据
+    const priceUrl = `https://api.polygon.io/v2/aggs/ticker/${polygonSymbol}/prev?adjusted=true&apiKey=${POLYGON_API_KEY}`;
+    const priceResponse = await fetch(priceUrl);
+    const priceData = await priceResponse.json();
     
-    // 格式化到期日
-    const expDate = `${parsed.expiration.slice(0, 4)}-${parsed.expiration.slice(4, 6)}-${parsed.expiration.slice(6, 8)}`;
+    let price = 0;
+    let change = 0;
+    let changePercent = 0;
     
-    let optionData: OptionData = {
+    if (priceData.status === 'OK' && priceData.results && priceData.results.length > 0) {
+      const result = priceData.results[0];
+      price = result.c || result.vw || 0;
+      change = result.c && result.o ? result.c - result.o : 0;
+      changePercent = result.c && result.o ? ((result.c - result.o) / result.o) * 100 : 0;
+    }
+    
+    const optionData: OptionData = {
       symbol: upperSymbol,
-      name: `${parsed.underlying} ${expDate} ${parsed.type === 'C' ? 'Call' : 'Put'} $${parsed.strike}`,
-      price: result.c || result.vw || 0,
-      change: result.c && result.o ? result.c - result.o : 0,
-      changePercent: result.c && result.o ? ((result.c - result.o) / result.o) * 100 : 0,
-      type: parsed.type === 'C' ? 'call' : 'put',
-      strikePrice: parseFloat(parsed.strike),
-      expirationDate: expDate,
+      name: `${parsed.underlying} ${contractData.results.expiration_date} ${contractData.results.contract_type === 'call' ? 'Call' : 'Put'} $${contractData.results.strike_price}`,
+      price: price,
+      change: change,
+      changePercent: changePercent,
+      type: contractData.results.contract_type as 'call' | 'put',
+      strikePrice: contractData.results.strike_price,
+      expirationDate: contractData.results.expiration_date,
       underlying: parsed.underlying
     };
     
@@ -175,92 +183,36 @@ router.get('/options/chain/:underlying', async (req, res) => {
     const { underlying } = req.params;
     const upperUnderlying = underlying.toUpperCase();
     
-    // Polygon.io 的 snapshot API 需要付费，但我们可以用聚合数据
-    // 这里返回提示信息
-    return res.status(501).json({
-      error: '期权链查询需要付费订阅',
-      message: '请手动输入期权代码，格式: AAPL250530C150',
-      example: 'AAPL250530C150 = Apple 2025-05-30 看涨期权 $150'
+    // 使用 Polygon.io v3 获取期权链
+    const url = `https://api.polygon.io/v3/reference/options/contracts?underlying_ticker=${upperUnderlying}&apiKey=${POLYGON_API_KEY}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    if (data.status !== 'OK') {
+      return res.status(404).json({
+        error: '无法获取期权链数据',
+        symbol: upperUnderlying
+      });
+    }
+    
+    // 返回期权列表
+    const options = data.results.map((contract: any) => ({
+      ticker: contract.ticker.replace('O:', ''),
+      type: contract.contract_type,
+      strikePrice: contract.strike_price,
+      expirationDate: contract.expiration_date,
+      sharesPerContract: contract.shares_per_contract
+    }));
+    
+    res.json({
+      underlying: upperUnderlying,
+      count: options.length,
+      options: options.slice(0, 50) // 限制返回数量
     });
   } catch (error) {
     console.error('获取期权链失败:', error);
     return res.status(500).json({
-      error: '服务器错误',
-      message: error instanceof Error ? error.message : '未知错误'
-    });
-  }
-});
-
-// 批量获取股票/期权数据
-router.post('/batch', async (req, res) => {
-  try {
-    const { symbols } = req.body;
-    
-    if (!Array.isArray(symbols)) {
-      return res.status(400).json({ error: 'symbols 必须是数组' });
-    }
-    
-    const results: (StockData | OptionData | { symbol: string; error: string })[] = [];
-    
-    for (const symbol of symbols) {
-      try {
-        const upperSymbol = symbol.toUpperCase();
-        
-        if (parseOptionSymbol(upperSymbol)) {
-          // 期权
-          const parsed = parseOptionSymbol(upperSymbol)!;
-          const polygonSymbol = toPolygonOptionSymbol(upperSymbol);
-          const url = `https://api.polygon.io/v2/aggs/ticker/${polygonSymbol}/prev?apiKey=${POLYGON_API_KEY}`;
-          const response = await fetch(url);
-          const data = await response.json();
-          
-          if (data.status === 'OK' && data.results && data.results.length > 0) {
-            const result = data.results[0];
-            const expDate = `${parsed.expiration.slice(0, 4)}-${parsed.expiration.slice(4, 6)}-${parsed.expiration.slice(6, 8)}`;
-            
-            results.push({
-              symbol: upperSymbol,
-              name: `${parsed.underlying} ${expDate} ${parsed.type === 'C' ? 'Call' : 'Put'} $${parsed.strike}`,
-              price: result.c || result.vw || 0,
-              change: result.c && result.o ? result.c - result.o : 0,
-              changePercent: result.c && result.o ? ((result.c - result.o) / result.o) * 100 : 0,
-              type: parsed.type === 'C' ? 'call' : 'put',
-              strikePrice: parseFloat(parsed.strike),
-              expirationDate: expDate,
-              underlying: parsed.underlying
-            });
-          } else {
-            results.push({ symbol: upperSymbol, error: '期权数据不存在' });
-          }
-        } else {
-          // 股票
-          const url = `https://finnhub.io/api/v1/quote?symbol=${upperSymbol}&token=${FINNHUB_API_KEY}`;
-          const response = await fetch(url);
-          const data = await response.json();
-          
-          if (data.c && data.c > 0) {
-            results.push({
-              symbol: upperSymbol,
-              name: upperSymbol,
-              price: data.c,
-              change: data.d,
-              changePercent: data.dp
-            });
-          } else {
-            results.push({ symbol: upperSymbol, error: '股票数据不存在' });
-          }
-        }
-      } catch {
-        results.push({ symbol: symbol, error: '获取失败' });
-      }
-    }
-    
-    res.json(results);
-  } catch (error) {
-    console.error('批量获取数据失败:', error);
-    return res.status(500).json({
-      error: '服务器错误',
-      message: error instanceof Error ? error.message : '未知错误'
+      error: '服务器错误，无法获取期权链'
     });
   }
 });
