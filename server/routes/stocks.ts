@@ -217,4 +217,112 @@ router.get('/options/chain/:underlying', async (req, res) => {
   }
 });
 
+function etfHoldingWeight(h: Record<string, unknown>): number {
+  const v = h.percent ?? h.percentage ?? h.weight;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') {
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+/**
+ * 用 Finnhub ETF 持仓推断「主成分股」：对单股杠杆 ETF 等，最大权重往往为对应正股。
+ * 注意：部分账户/免费层无 holdings 或成分以互换为主，需与前端手写 UNDERLYING_EQUIVALENTS 互补。
+ * GET /api/symbol/canonical-underlying/:symbol
+ */
+router.get('/symbol/canonical-underlying/:symbol', async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '')
+      .trim()
+      .toUpperCase();
+    if (!symbol) {
+      return res.status(400).json({ error: '缺少 symbol' });
+    }
+
+    const url = `https://finnhub.io/api/v1/etf/holdings?symbol=${encodeURIComponent(
+      symbol
+    )}&token=${FINNHUB_API_KEY}`;
+    const response = await fetch(url);
+    const data = (await response.json()) as {
+      holdings?: Array<Record<string, unknown>>;
+      error?: string;
+    };
+
+    if (data.error || !Array.isArray(data.holdings) || data.holdings.length === 0) {
+      return res.json({
+        canonical: symbol,
+        source: 'no_holdings' as const
+      });
+    }
+
+    let bestSym = '';
+    let bestW = -1;
+    for (const h of data.holdings) {
+      const rawSym = h.symbol ?? h.asset ?? h.ticker;
+      const sym = String(rawSym ?? '')
+        .trim()
+        .toUpperCase();
+      if (!sym || sym === symbol) continue;
+      const w = etfHoldingWeight(h);
+      if (w > bestW) {
+        bestW = w;
+        bestSym = sym;
+      }
+    }
+
+    if (!bestSym) {
+      return res.json({
+        canonical: symbol,
+        source: 'no_primary' as const
+      });
+    }
+
+    return res.json({
+      canonical: bestSym,
+      source: 'finnhub_etf_holdings' as const,
+      weight: bestW >= 0 ? bestW : undefined
+    });
+  } catch (error) {
+    console.error('canonical-underlying:', error);
+    return res.json({
+      canonical: String(req.params.symbol || '')
+        .trim()
+        .toUpperCase(),
+      source: 'error' as const
+    });
+  }
+});
+
+// Finnhub Symbol Search（Symbol Lookup），供前端补全未在本地表中的代码/公司名
+router.get('/search', async (req, res) => {
+  try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!q) {
+      return res.json({ count: 0, result: [] });
+    }
+    const exchange = typeof req.query.exchange === 'string' ? req.query.exchange.trim() : '';
+    let url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q)}&token=${FINNHUB_API_KEY}`;
+    if (exchange) {
+      url += `&exchange=${encodeURIComponent(exchange)}`;
+    }
+    const response = await fetch(url);
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: 'Symbol search 请求失败',
+        status: response.status
+      });
+    }
+    const data = (await response.json()) as unknown;
+    res.json(data);
+  } catch (error) {
+    console.error('Finnhub /search:', error);
+    res.status(500).json({
+      error: '服务器错误',
+      message: error instanceof Error ? error.message : '未知错误'
+    });
+  }
+});
+
 export default router;
