@@ -20,6 +20,7 @@ interface AlphaVantageGlobalQuote {
 interface AppState {
   stocks: Stock[];
   totalValue: number;
+  cash: number;
   loading: boolean;
   error: string;
 }
@@ -28,6 +29,7 @@ interface AppState {
 const state: AppState = {
   stocks: [],
   totalValue: 0,
+  cash: 0,
   loading: false,
   error: ''
 };
@@ -266,13 +268,18 @@ async function fetchBatchStockData(symbols: string[]): Promise<any[]> {
 
 // 函数：计算总计
 function calculateTotals(): void {
-  state.totalValue = state.stocks.reduce((sum, stock) => {
+  // 计算股票总市值
+  const stocksValue = state.stocks.reduce((sum, stock) => {
     return sum + (stock.shares * stock.currentPrice);
   }, 0);
   
+  // 总资产 = 股票市值 + 现金
+  const totalAssets = stocksValue + state.cash;
+  state.totalValue = stocksValue;
+  
   state.stocks = state.stocks.map(stock => {
     const position = stock.shares * stock.currentPrice;
-    const weight = state.totalValue > 0 ? (position / state.totalValue) * 100 : 0;
+    const weight = totalAssets > 0 ? (position / totalAssets) * 100 : 0;
     return {
       ...stock,
       position,
@@ -290,7 +297,8 @@ function saveToStorage(): void {
       shares: s.shares,
       targetPrice: s.targetPrice,
       currentPrice: s.currentPrice
-    }))
+    })),
+    cash: state.cash
   };
   localStorage.setItem('stockPortfolio', JSON.stringify(data));
 }
@@ -306,11 +314,20 @@ function loadFromStorage(): void {
         position: 0,
         weight: 0
       }));
+      state.cash = parsed.cash || 0;
       calculateTotals();
     }
   } catch (error) {
     console.error('加载数据失败:', error);
   }
+}
+
+// 函数：更新现金
+function updateCash(value: number): void {
+  state.cash = value;
+  calculateTotals();
+  saveToStorage();
+  render();
 }
 
 // 函数：更新股票价格
@@ -511,12 +528,22 @@ function render(): void {
           
           <div class="summary">
             <div class="summary-card">
-              <h3>总持仓</h3>
+              <h3>现金</h3>
+              <div class="value" style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 0.9rem;">$</span>
+                <input type="number" value="${state.cash}" 
+                       onchange="updateCash(parseFloat(this.value) || 0)" 
+                       style="width: 100px; padding: 4px 8px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.1); color: white; font-size: 1.2rem; font-weight: 600;"
+                       step="0.01" min="0" />
+              </div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+              <h3>股票市值</h3>
               <div class="value">$${formatNumber(state.totalValue)}</div>
             </div>
             <div class="summary-card" style="background: linear-gradient(135deg, #059669 0%, #10b981 100%);">
-              <h3>持仓数量</h3>
-              <div class="value">${state.stocks.length}</div>
+              <h3>总资产</h3>
+              <div class="value">$${formatNumber(state.totalValue + state.cash)}</div>
             </div>
           </div>
         `}
@@ -553,6 +580,7 @@ init();
 (window as any).removeStock = removeStock;
 (window as any).updateStock = updateStock;
 (window as any).updateStockPrices = updateStockPrices;
+(window as any).updateCash = updateCash;
 (window as any).selectStock = selectStock;
 
 // 下拉搜索相关变量
