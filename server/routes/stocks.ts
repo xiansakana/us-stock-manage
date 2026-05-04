@@ -1,11 +1,6 @@
 import { Router } from 'express';
-import { FetchClient, Config } from 'coze-coding-dev-sdk';
 
 const router = Router();
-
-// 创建 FetchClient 实例
-const config = new Config();
-const client = new FetchClient(config);
 
 // Finnhub API Key
 const FINNHUB_API_KEY = 'd7sa5a1r01qorsvhvrlgd7sa5a1r01qorsvhvrm0';
@@ -17,8 +12,6 @@ interface StockData {
   price: number;
   change: number;
   changePercent: number;
-  marketCap?: number;
-  pe?: number;
 }
 
 // 获取股票数据
@@ -26,18 +19,15 @@ router.get('/stock/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     
-    // 使用 Finnhub API 获取股票报价
+    // 使用原生 fetch 调用 Finnhub API
     const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
+    const response = await fetch(quoteUrl);
     
-    const response = await client.fetch(quoteUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
     
-    // 解析 JSON 内容
-    const htmlContent = response.content
-      .filter((item: any) => item.type === 'text')
-      .map((item: any) => item.text)
-      .join('\n');
-    
-    const quoteData = JSON.parse(htmlContent);
+    const quoteData = await response.json();
     
     // Finnhub 返回: { c: current price, d: change, dp: change percent, h: high, l: low, o: open, pc: previous close, t: timestamp }
     if (!quoteData.c && quoteData.c !== 0) {
