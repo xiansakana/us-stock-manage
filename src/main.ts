@@ -226,8 +226,8 @@ async function fetchBatchStockData(symbols: string[]): Promise<any[]> {
     try {
       const data = await fetchStockDataFromAPI(symbol);
       results.push(data);
-      // 添加延迟以遵守 API rate limit (每分钟 5 次请求)
-      await new Promise(resolve => setTimeout(resolve, 13000));
+      // 添加延迟以遵守 API rate limit
+      await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (error) {
       console.error(`获取 ${symbol} 数据失败:`, error);
       results.push({
