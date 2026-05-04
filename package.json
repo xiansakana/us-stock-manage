@@ -21,7 +21,7 @@
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
     "autoprefixer": "^10.4.20",
-    "coze-coding-dev-sdk": "^0.7.16",
+    "coze-coding-dev-sdk": "^0.7.21",
     "esbuild": "^0.24.2",
     "eslint": "^9",
     "only-allow": "^1.2.2",

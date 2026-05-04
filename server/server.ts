@@ -30,20 +30,22 @@ async function startServer(): Promise<Server> {
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
-  // 注册 API 路由
+  // 注册 API 路由 - 必须在 Vite middleware 之前注册
   app.use(router);
 
   // 集成 Vite（开发模式）或静态文件服务（生产模式）
   await setupVite(app);
 
   // 全局错误处理
-  app.use((err: Error, req: express.Request, res: express.Response) => {
+  app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error('Server error:', err);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const status = 'status' in err ? (err as any).status || 500 : 500;
-    res.status(status).json({
-      error: err.message || 'Internal server error',
-    });
+    if (res && typeof res.status === 'function') {
+      res.status(status).json({
+        error: err.message || 'Internal server error',
+      });
+    }
   });
 
   server.once('error', err => {
