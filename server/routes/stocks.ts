@@ -7,6 +7,9 @@ const router = Router();
 const config = new Config();
 const client = new FetchClient(config);
 
+// Finnhub API Key
+const FINNHUB_API_KEY = 'd7sa5a1r01qorsvhvrlgd7sa5a1r01qorsvhvrm0';
+
 // 股票数据接口
 interface StockData {
   symbol: string;
@@ -23,142 +26,49 @@ router.get('/stock/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     
-    // 使用 Yahoo Finance 的查询 API
-    const queryUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
+    // 使用 Finnhub API 获取股票报价
+    const quoteUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
     
-    const response = await client.fetch(queryUrl);
-    
-    // 从返回的文本内容中提取股票信息
-    let stockData: StockData = {
-      symbol: symbol.toUpperCase(),
-      name: symbol.toUpperCase(),
-      price: 0,
-      change: 0,
-      changePercent: 0
-    };
+    const response = await client.fetch(quoteUrl);
     
     // 解析 JSON 内容
     const htmlContent = response.content
-      .filter(item => item.type === 'text')
-      .map(item => item.text)
+      .filter((item: any) => item.type === 'text')
+      .map((item: any) => item.text)
       .join('\n');
     
-    try {
-      const data = JSON.parse(htmlContent);
-      
-      if (data.chart && data.chart.result && data.chart.result[0]) {
-        const result = data.chart.result[0];
-        const meta = result.meta;
-        
-        stockData.price = meta.regularMarketPrice || 0;
-        stockData.change = meta.regularMarketChange || 0;
-        stockData.changePercent = meta.regularMarketChangePercent || 0;
-        stockData.name = meta.shortName || meta.symbol || symbol.toUpperCase();
-        
-        // 如果无法从 Yahoo 获取，返回估算数据作为备选
-        if (stockData.price === 0) {
-          return res.status(404).json({
-            error: '无法获取股票数据，请检查股票代码是否正确',
-            symbol: symbol.toUpperCase()
-          });
-        }
-        
-        res.json(stockData);
-      } else {
-        return res.status(404).json({
-          error: '无法获取股票数据，请检查股票代码是否正确',
-          symbol: symbol.toUpperCase()
-        });
-      }
-    } catch (parseError) {
-      console.error('解析股票数据失败:', parseError);
+    const quoteData = JSON.parse(htmlContent);
+    
+    // Finnhub 返回: { c: current price, d: change, dp: change percent, h: high, l: low, o: open, pc: previous close, t: timestamp }
+    if (!quoteData.c && quoteData.c !== 0) {
       return res.status(404).json({
         error: '无法获取股票数据，请检查股票代码是否正确',
         symbol: symbol.toUpperCase()
       });
     }
-  } catch (error) {
-    console.error('获取股票数据失败:', error);
-    res.status(500).json({
-      error: '服务器错误，请稍后重试'
-    });
-  }
-});
-
-// 批量获取股票数据
-router.post('/stocks/batch', async (req, res) => {
-  try {
-    const { symbols } = req.body;
     
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      return res.status(400).json({
-        error: '请提供有效的股票代码数组'
+    // 如果价格为空或为0，说明股票代码无效
+    if (quoteData.c === 0 && quoteData.pc === 0) {
+      return res.status(404).json({
+        error: '无法获取股票数据，请检查股票代码是否正确',
+        symbol: symbol.toUpperCase()
       });
     }
     
-    const results: StockData[] = [];
+    let stockData: StockData = {
+      symbol: symbol.toUpperCase(),
+      name: symbol.toUpperCase(),
+      price: quoteData.c,
+      change: quoteData.d,
+      changePercent: quoteData.dp
+    };
     
-    // 逐个获取股票数据
-    for (const symbol of symbols) {
-      try {
-        const queryUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
-        const response = await client.fetch(queryUrl);
-        
-        const htmlContent = response.content
-          .filter(item => item.type === 'text')
-          .map(item => item.text)
-          .join('\n');
-        
-        try {
-          const data = JSON.parse(htmlContent);
-          
-          if (data.chart && data.chart.result && data.chart.result[0]) {
-            const result = data.chart.result[0];
-            const meta = result.meta;
-            
-            results.push({
-              symbol: symbol.toUpperCase(),
-              name: meta.shortName || meta.symbol || symbol.toUpperCase(),
-              price: meta.regularMarketPrice || 0,
-              change: meta.regularMarketChange || 0,
-              changePercent: meta.regularMarketChangePercent || 0
-            });
-          } else {
-            results.push({
-              symbol: symbol.toUpperCase(),
-              name: symbol.toUpperCase(),
-              price: 0,
-              change: 0,
-              changePercent: 0
-            });
-          }
-        } catch (parseError) {
-          console.error(`解析 ${symbol} 数据失败:`, parseError);
-          results.push({
-            symbol: symbol.toUpperCase(),
-            name: symbol.toUpperCase(),
-            price: 0,
-            change: 0,
-            changePercent: 0
-          });
-        }
-      } catch (err) {
-        console.error(`获取 ${symbol} 数据失败:`, err);
-        results.push({
-          symbol: symbol.toUpperCase(),
-          name: symbol.toUpperCase(),
-          price: 0,
-          change: 0,
-          changePercent: 0
-        });
-      }
-    }
-    
-    res.json(results);
+    res.json(stockData);
   } catch (error) {
-    console.error('批量获取股票数据失败:', error);
-    res.status(500).json({
-      error: '服务器错误，请稍后重试'
+    console.error('获取股票数据失败:', error);
+    return res.status(500).json({
+      error: '服务器错误，无法获取股票数据',
+      message: error instanceof Error ? error.message : '未知错误'
     });
   }
 });
