@@ -7,6 +7,18 @@ interface Stock {
   currentPrice: number;
   position: number;
   weight: number;
+  type?: 'stock' | 'option'; // 股票或期权
+  optionStrike?: number;      // 期权执行价
+  optionExpiry?: string;       // 期权到期日
+  optionType?: 'C' | 'P';      // 期权类型 C=看涨 P=看跌
+}
+
+// 导出数据结构
+interface ExportData {
+  version: string;
+  exportDate: string;
+  cash: number;
+  stocks: Stock[];
 }
 
 // 股票数据接口 (来自后端 API)
@@ -261,11 +273,202 @@ function saveToStorage(): void {
       name: s.name,
       shares: s.shares,
       targetPrice: s.targetPrice,
-      currentPrice: s.currentPrice
+      currentPrice: s.currentPrice,
+      type: s.type,
+      optionStrike: s.optionStrike,
+      optionExpiry: s.optionExpiry,
+      optionType: s.optionType
     })),
     cash: state.cash
   };
   localStorage.setItem('stockPortfolio', JSON.stringify(data));
+}
+
+// 导出数据为 JSON 文件
+function exportToJSON(): void {
+  const exportData: ExportData = {
+    version: '1.0',
+    exportDate: new Date().toISOString(),
+    cash: state.cash,
+    stocks: state.stocks.map(s => ({
+      symbol: s.symbol,
+      name: s.name,
+      shares: s.shares,
+      targetPrice: s.targetPrice,
+      currentPrice: s.currentPrice,
+      position: s.position,
+      weight: s.weight,
+      type: s.type,
+      optionStrike: s.optionStrike,
+      optionExpiry: s.optionExpiry,
+      optionType: s.optionType
+    }))
+  };
+  
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `portfolio_${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  renderSuccess('数据已导出为 JSON 文件');
+}
+
+// 导出数据为 CSV 文件
+function exportToCSV(): void {
+  const headers = ['代码', '名称', '类型', '股数', '现价', '持仓', '仓位', '1y目标价', '期权执行价', '期权到期日', '期权类型'];
+  const rows = state.stocks.map(s => [
+    s.symbol,
+    s.name,
+    s.type === 'option' ? '期权' : '股票',
+    s.shares,
+    s.currentPrice,
+    s.position,
+    s.weight,
+    s.targetPrice,
+    s.optionStrike || '',
+    s.optionExpiry || '',
+    s.optionType || ''
+  ]);
+  
+  // 添加现金行
+  const csvContent = [
+    headers.join(','),
+    ...rows.map(r => r.map(cell => `"${cell}"`).join(',')),
+    '',
+    `"现金","","","","","${state.cash}"`
+  ].join('\n');
+  
+  const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `portfolio_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  renderSuccess('数据已导出为 CSV 文件');
+}
+
+// 从 JSON 文件导入
+function importFromJSON(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const content = e.target?.result as string;
+      const data = JSON.parse(content) as ExportData;
+      
+      if (data.stocks && Array.isArray(data.stocks)) {
+        state.stocks = data.stocks.map(s => ({
+          ...s,
+          position: s.shares * s.currentPrice,
+          weight: 0
+        }));
+        state.cash = data.cash || 0;
+        calculateTotals();
+        saveToStorage();
+        render();
+        
+        // 如果有股票，自动更新价格
+        if (state.stocks.length > 0) {
+          setTimeout(() => updateStockPrices(), 500);
+        }
+        
+        renderSuccess(`成功导入 ${state.stocks.length} 条记录`);
+      } else {
+        renderError('无效的数据格式');
+      }
+    } catch (error) {
+      renderError('导入失败：文件格式错误');
+    }
+  };
+  reader.readAsText(file);
+  
+  // 清空 input 以允许再次选择同一文件
+  input.value = '';
+}
+
+// 从 CSV 文件导入
+function importFromCSV(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const content = e.target?.result as string;
+      const lines = content.split('\n').filter(line => line.trim());
+      
+      if (lines.length < 2) {
+        renderError('CSV 文件内容为空或格式错误');
+        return;
+      }
+      
+      // 跳过标题行，解析数据
+      const newStocks: Stock[] = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.includes('"现金"')) continue; // 跳过现金行
+        
+        // 解析 CSV 行
+        const values: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        
+        for (const char of line) {
+          if (char === '"') {
+            inQuotes = !inQuotes;
+          } else if (char === ',' && !inQuotes) {
+            values.push(current.trim());
+            current = '';
+          } else {
+            current += char;
+          }
+        }
+        values.push(current.trim());
+        
+        if (values[0] && values[3]) { // 代码和股数存在
+          newStocks.push({
+            symbol: values[0].toUpperCase(),
+            name: values[1] || STOCK_NAMES[values[0].toUpperCase()] || values[0].toUpperCase(),
+            type: values[2] === '期权' ? 'option' : 'stock',
+            shares: parseFloat(values[3]) || 0,
+            targetPrice: parseFloat(values[7]) || 0,
+            currentPrice: parseFloat(values[4]) || 0,
+            position: parseFloat(values[5]) || 0,
+            weight: 0,
+            optionStrike: values[8] ? parseFloat(values[8]) : undefined,
+            optionExpiry: values[9] || undefined,
+            optionType: (values[10] as 'C' | 'P') || undefined
+          });
+        }
+      }
+      
+      if (newStocks.length > 0) {
+        state.stocks = newStocks;
+        calculateTotals();
+        saveToStorage();
+        render();
+        
+        if (state.stocks.length > 0) {
+          setTimeout(() => updateStockPrices(), 500);
+        }
+        
+        renderSuccess(`成功导入 ${state.stocks.length} 条记录`);
+      } else {
+        renderError('未找到有效的持仓数据');
+      }
+    } catch (error) {
+      renderError('导入失败：文件格式错误');
+    }
+  };
+  reader.readAsText(file);
+  input.value = '';
 }
 
 // 函数：从 localStorage 加载
@@ -339,13 +542,13 @@ async function addStock(): Promise<void> {
   const targetPrice = parseFloat(targetPriceInput.value) || 0;
   
   if (!symbol) {
-    renderError('请输入股票代码');
+    renderError('请输入股票代码或期权代码');
     return;
   }
   
   // 检查是否已存在
   if (state.stocks.find(s => s.symbol === symbol)) {
-    renderError('该股票已在持仓列表中');
+    renderError('该标的已在持仓列表中');
     return;
   }
   
@@ -353,16 +556,31 @@ async function addStock(): Promise<void> {
   render();
   
   try {
-    const stockData = await fetchStockDataFromAPI(symbol);
+    // 判断是否是期权
+    const isOption = selectedOptionData.strike !== undefined;
+    let stockData: StockData;
     
+    if (isOption) {
+      // 期权：使用标的股票价格
+      const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
+      stockData = await fetchStockDataFromAPI(underlying);
+    } else {
+      stockData = await fetchStockDataFromAPI(symbol);
+    }
+    
+    const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
     const newStock: Stock = {
       symbol,
-      name: stockData.name || symbol,
+      name: isOption ? `${STOCK_NAMES[underlying] || underlying} 期权` : (stockData.name || symbol),
       shares,
       targetPrice,
       currentPrice: stockData.price || 0,
       position: 0,
-      weight: 0
+      weight: 0,
+      type: isOption ? 'option' : 'stock',
+      optionStrike: selectedOptionData.strike,
+      optionExpiry: selectedOptionData.expiry,
+      optionType: selectedOptionData.type
     };
     
     state.stocks.push(newStock);
@@ -371,11 +589,13 @@ async function addStock(): Promise<void> {
     symbolInput.value = '';
     sharesInput.value = '';
     targetPriceInput.value = '';
+    selectedOptionData = {};
+    clearOptionInfoDisplay();
     
     calculateTotals();
     renderSuccess(`已添加 ${symbol}`);
   } catch (error) {
-    renderError('添加股票失败，请检查股票代码是否正确');
+    renderError('添加失败，请检查代码是否正确');
   } finally {
     state.loading = false;
     render();
@@ -429,12 +649,13 @@ function render(): void {
           </div>
           <div style="display: flex; gap: 10px; align-items: end;">
             <button class="btn btn-primary" onclick="addStock()" ${state.loading ? 'disabled' : ''}>
-              ${state.loading ? '<span class="loading"></span>' : '添加股票'}
+              ${state.loading ? '<span class="loading"></span>' : '添加'}
             </button>
             <button class="btn btn-secondary" onclick="updateStockPrices()" ${state.loading || state.stocks.length === 0 ? 'disabled' : ''}>
               ${state.loading ? '<span class="loading"></span>' : '刷新价格'}
             </button>
           </div>
+          <div id="option-info" style="display: none; margin-top: 10px;"></div>
         </div>
         
         ${state.stocks.length === 0 ? `
@@ -443,26 +664,53 @@ function render(): void {
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
             <h3>暂无持仓</h3>
-            <p>在上方输入股票代码开始添加您的持仓</p>
+            <p>在上方输入股票代码或期权代码开始添加</p>
+            <p style="font-size: 0.85rem; color: #888; margin-top: 8px;">期权格式: AAPL250530C150</p>
           </div>
         ` : `
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h3 style="margin: 0;">持仓明细</h3>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-secondary" onclick="exportToJSON()" style="padding: 8px 16px; font-size: 0.85rem;">
+                导出 JSON
+              </button>
+              <button class="btn btn-secondary" onclick="exportToCSV()" style="padding: 8px 16px; font-size: 0.85rem;">
+                导出 CSV
+              </button>
+              <label class="btn btn-secondary" style="padding: 8px 16px; font-size: 0.85rem; cursor: pointer;">
+                导入
+                <input type="file" accept=".json,.csv" onchange="importFromJSON(event)" style="display: none;" />
+              </label>
+              <label class="btn btn-secondary" style="padding: 8px 16px; font-size: 0.85rem; cursor: pointer;">
+                导入 CSV
+                <input type="file" accept=".csv" onchange="importFromCSV(event)" style="display: none;" />
+              </label>
+            </div>
+          </div>
           <div class="table-container">
             <table>
               <thead>
                 <tr>
+                  <th>类型</th>
                   <th>代码</th>
-                  <th>股票名称</th>
+                  <th>名称</th>
                   <th>股数</th>
                   <th>现价</th>
                   <th>持仓</th>
                   <th>仓位</th>
                   <th>1y目标价</th>
+                  <th>期权信息</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 ${state.stocks.map(stock => `
-                  <tr>
+                  <tr ${stock.type === 'option' ? 'style="background: rgba(102, 126, 234, 0.05);"' : ''}>
+                    <td>
+                      ${stock.type === 'option' 
+                        ? '<span style="background: #667eea; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">期权</span>' 
+                        : '<span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">股票</span>'}
+                    </td>
                     <td style="font-weight: 600; color: #667eea;">${stock.symbol}</td>
                     <td>${stock.name}</td>
                     <td>
@@ -479,6 +727,11 @@ function render(): void {
                              onchange="updateStock('${stock.symbol}', 'targetPrice', parseFloat(this.value) || 0)" 
                              style="width: 80px; padding: 6px; border: 1px solid #e5e7eb; border-radius: 6px; text-align: center;"
                              step="0.01" min="0" />
+                    </td>
+                    <td style="font-size: 0.8rem; color: #666;">
+                      ${stock.type === 'option' && stock.optionStrike
+                        ? `${stock.optionType === 'C' ? 'Call' : 'Put'} $${stock.optionStrike}<br/><span style="color: #999;">${stock.optionExpiry || ''}</span>`
+                        : '-'}
                     </td>
                     <td>
                       <button class="btn btn-danger" onclick="removeStock('${stock.symbol}')" style="padding: 6px 12px; font-size: 0.85rem;">
@@ -547,42 +800,109 @@ init();
 (window as any).updateStockPrices = updateStockPrices;
 (window as any).updateCash = updateCash;
 (window as any).selectStock = selectStock;
+(window as any).exportToJSON = exportToJSON;
+(window as any).exportToCSV = exportToCSV;
+(window as any).importFromJSON = importFromJSON;
+(window as any).importFromCSV = importFromCSV;
+(window as any).highlightSuggestion = highlightSuggestion;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
 
 // 函数：过滤股票
-function filterStocks(query: string): Array<{symbol: string; name: string}> {
+interface SuggestionItem {
+  symbol: string;
+  name: string;
+  type?: 'stock' | 'option';
+  optionStrike?: number;
+  optionExpiry?: string;
+  optionType?: 'C' | 'P';
+}
+
+function filterStocks(query: string): SuggestionItem[] {
   if (!query.trim()) return [];
   
   const upperQuery = query.toUpperCase();
   const lowerQuery = query.toLowerCase();
   
-  return Object.entries(STOCK_NAMES)
-    .filter(([symbol, name]) => {
-      return symbol.includes(upperQuery) || name.toLowerCase().includes(lowerQuery);
-    })
-    .slice(0, 10) // 最多显示10个结果
-    .map(([symbol, name]) => ({ symbol, name }));
+  const results: SuggestionItem[] = [];
+  
+  // 检查是否是期权代码格式：标的代码 + 到期日 + C/P + 执行价
+  // 例如: AAPL250530C150 = Apple 2025-05-30 Call 150
+  const optionMatch = upperQuery.match(/^([A-Z]{1,5})(\d{6})([CP])(\d+)$/);
+  if (optionMatch) {
+    const [, symbol, expiry, type, strike] = optionMatch;
+    const underlyingName = STOCK_NAMES[symbol] || symbol;
+    const dateStr = `${expiry.slice(0, 2)}-${expiry.slice(2, 4)}-${expiry.slice(4, 6)}`;
+    results.push({
+      symbol: `${symbol}${expiry}${type}${strike}`,
+      name: `${underlyingName} 期权 ${type === 'C' ? '看涨' : '看跌'} $${strike} ${dateStr}`,
+      type: 'option',
+      optionStrike: parseFloat(strike),
+      optionExpiry: `20${dateStr}`,
+      optionType: type as 'C' | 'P'
+    });
+  }
+  
+  // 检查是否输入了期权部分格式，提供期权建议
+  if (/^[A-Z]{1,5}\d{0,6}$/.test(upperQuery) && upperQuery.length >= 2) {
+    // 添加股票选项
+    const stockResults = Object.entries(STOCK_NAMES)
+      .filter(([symbol, name]) => {
+        return symbol.includes(upperQuery) || name.toLowerCase().includes(lowerQuery);
+      })
+      .slice(0, 5)
+      .map(([symbol, name]) => ({ symbol, name, type: 'stock' as const }));
+    
+    results.push(...stockResults);
+    
+    // 如果输入了至少4个字符，添加期权快速添加提示
+    if (upperQuery.length >= 4 && /^[A-Z]{1,5}$/.test(upperQuery.slice(0, -3))) {
+      const stockSymbol = Object.keys(STOCK_NAMES).find(s => s.startsWith(upperQuery.slice(0, -3)));
+      if (stockSymbol) {
+        // 格式说明
+        const expiryExample = 'YYMMDD';
+        const strikeExample = '150';
+        results.push({
+          symbol: upperQuery,
+          name: `期权格式: ${stockSymbol}${expiryExample}${strikeExample}`,
+          type: 'option'
+        });
+      }
+    }
+  } else {
+    // 普通搜索
+    const stockResults = Object.entries(STOCK_NAMES)
+      .filter(([symbol, name]) => {
+        return symbol.includes(upperQuery) || name.toLowerCase().includes(lowerQuery);
+      })
+      .slice(0, 10)
+      .map(([symbol, name]) => ({ symbol, name, type: 'stock' as const }));
+    
+    results.push(...stockResults);
+  }
+  
+  return results.slice(0, 10);
 }
 
 // 函数：显示下拉建议
-function showSuggestions(suggestions: Array<{symbol: string; name: string}>): void {
+function showSuggestions(suggestions: SuggestionItem[]): void {
   const dropdown = document.getElementById('stock-suggestions');
   if (!dropdown) return;
   
   if (suggestions.length === 0) {
-    dropdown.innerHTML = '<div class="no-results">未找到匹配的股票</div>';
+    dropdown.innerHTML = '<div class="no-results">输入股票代码或期权代码搜索<br><small style="color:#999">期权格式: AAPL250530C150</small></div>';
     dropdown.style.display = 'block';
     return;
   }
   
   dropdown.innerHTML = suggestions.map((item, index) => `
-    <div class="suggestion-item ${index === selectedIndex ? 'selected' : ''}" 
-         onclick="selectStock('${item.symbol}')"
+    <div class="suggestion-item ${index === selectedIndex ? 'selected' : ''} ${item.type === 'option' ? 'option-item' : ''}" 
+         onclick="selectStock('${item.symbol}', ${item.optionStrike ? item.optionStrike : 'undefined'}, '${item.optionExpiry || ''}', '${item.optionType || ''}')"
          onmouseenter="highlightSuggestion(${index})">
       <span class="suggestion-symbol">${item.symbol}</span>
       <span class="suggestion-name">${item.name}</span>
+      ${item.type === 'option' ? '<span class="option-badge">期权</span>' : ''}
     </div>
   `).join('');
   
@@ -609,17 +929,63 @@ function highlightSuggestion(index: number): void {
 }
 
 // 函数：选择股票
-function selectStock(symbol: string): void {
+// 存储选中的期权信息
+let selectedOptionData: {strike?: number; expiry?: string; type?: 'C' | 'P'} = {};
+
+function selectStock(symbol: string, strike?: number, expiry?: string, type?: string): void {
   const input = document.getElementById('symbol') as HTMLInputElement;
   if (input) {
     input.value = symbol;
   }
+  
+  // 保存期权信息
+  if (strike && expiry && type) {
+    selectedOptionData = {
+      strike,
+      expiry,
+      type: type as 'C' | 'P'
+    };
+    // 更新期权信息显示
+    updateOptionInfoDisplay(symbol, strike, expiry, type);
+  } else {
+    selectedOptionData = {};
+    clearOptionInfoDisplay();
+  }
+  
   hideSuggestions();
   
   // 聚焦到股数输入框
   const sharesInput = document.getElementById('shares') as HTMLInputElement;
   if (sharesInput) {
     sharesInput.focus();
+  }
+}
+
+// 更新期权信息显示
+function updateOptionInfoDisplay(symbol: string, strike: number, expiry: string, type: string): void {
+  const container = document.getElementById('option-info');
+  if (container) {
+    const underlying = symbol.match(/^[A-Z]+/)?.[0] || symbol;
+    const name = STOCK_NAMES[underlying] || underlying;
+    container.innerHTML = `
+      <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 12px; border-radius: 8px; color: white;">
+        <div style="font-weight: 600; margin-bottom: 8px;">期权信息</div>
+        <div style="font-size: 0.9rem;">标的: ${name}</div>
+        <div style="font-size: 0.9rem;">类型: ${type === 'C' ? '看涨 (Call)' : '看跌 (Put)'}</div>
+        <div style="font-size: 0.9rem;">执行价: $${strike}</div>
+        <div style="font-size: 0.9rem;">到期日: ${expiry}</div>
+      </div>
+    `;
+    container.style.display = 'block';
+  }
+}
+
+// 清除期权信息显示
+function clearOptionInfoDisplay(): void {
+  const container = document.getElementById('option-info');
+  if (container) {
+    container.style.display = 'none';
+    container.innerHTML = '';
   }
 }
 
