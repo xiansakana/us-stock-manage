@@ -264,6 +264,13 @@ function computeLinePnL(stock: Stock): number | null {
   return (stock.currentPrice - Number(c)) * stock.shares * positionMultiplier(stock);
 }
 
+/** 盈亏比例 = (现价 − 成本) ÷ 成本 × 100%；无有效成本返回 null */
+function computeLinePnLPercent(stock: Stock): number | null {
+  const c = stock.avgCost;
+  if (c === undefined || c === null || Number.isNaN(Number(c)) || Number(c) <= 0) return null;
+  return ((stock.currentPrice - Number(c)) / Number(c)) * 100;
+}
+
 function formatPnLCell(pnl: number | null): string {
   if (pnl === null || Number.isNaN(pnl)) {
     return '<span style="color:#94a3b8;">—</span>';
@@ -271,6 +278,15 @@ function formatPnLCell(pnl: number | null): string {
   const color = pnl >= 0 ? '#059669' : '#dc2626';
   const sign = pnl >= 0 ? '+' : '';
   return `<span style="color:${color}; font-weight:600;">${sign}$${formatNumber(pnl)}</span>`;
+}
+
+function formatPnLPercentCell(pct: number | null): string {
+  if (pct === null || Number.isNaN(pct)) {
+    return '<span style="color:#94a3b8;">—</span>';
+  }
+  const color = pct >= 0 ? '#059669' : '#dc2626';
+  const sign = pct >= 0 ? '+' : '';
+  return `<span style="color:${color}; font-weight:600;">${sign}${formatNumber(pct, 2)}%</span>`;
 }
 
 /** 顶部总盈亏卡片（白字卡片上用浅色区分正负） */
@@ -752,6 +768,7 @@ function exportToCSV(): void {
     '成本',
     '现价',
     '盈亏',
+    '盈亏比例',
     '持仓',
     '品类占组合%',
     '1y目标价',
@@ -765,6 +782,7 @@ function exportToCSV(): void {
   const cashW = totalA > 0 ? (state.cash / totalA) * 100 : 0;
   const rows = state.stocks.map(s => {
     const pnl = computeLinePnL(s);
+    const pnlPct = computeLinePnLPercent(s);
     const category = s.type === 'option' ? '期权' : '股票';
     const displayType = s.type === 'option' ? '期权' : (s.instrumentType ?? '股票');
     return [
@@ -776,6 +794,7 @@ function exportToCSV(): void {
       s.avgCost ?? '',
       s.currentPrice,
       pnl === null ? '' : pnl,
+      pnlPct === null ? '' : formatNumber(pnlPct, 2),
       s.position,
       s.weight,
       s.targetPrice ?? '',
@@ -787,12 +806,13 @@ function exportToCSV(): void {
     ];
   });
 
-  /** 16 列：持仓列存现金金额，品类占比列为现金占总资产比例 */
+  /** 17 列：持仓列存现金金额，品类占比列为现金占总资产比例 */
   const cashCsvRow: (string | number)[] = [
     'CASH',
     '现金',
     '现金',
     '现金',
+    '',
     '',
     '',
     '',
@@ -895,6 +915,7 @@ function importFromCSV(event: Event): void {
       const newStocks: Stock[] = [];
       let cashFromCsv: number | null = null;
       const hasPinZhong = lines[0].includes('品种');
+      const hasPnlPctCol = lines[0].includes('盈亏比例');
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
@@ -917,7 +938,9 @@ function importFromCSV(event: Event): void {
 
         const code = values[0] ?? '';
         if (code.includes('现金') || code.toUpperCase() === 'CASH') {
-          const cashIdx = hasPinZhong ? 8 : 7;
+          let cashIdx = 7;
+          if (hasPinZhong) cashIdx = hasPnlPctCol ? 9 : 8;
+          else if (hasPnlPctCol) cashIdx = 8;
           const raw = String(values[cashIdx] ?? '').replace(/,/g, '');
           const v = parseFloat(raw);
           if (Number.isFinite(v)) cashFromCsv = v;
@@ -929,16 +952,17 @@ function importFromCSV(event: Event): void {
           continue;
         }
 
-        if (hasPinZhong && values.length >= 16) {
+        const pinOff = hasPnlPctCol ? 1 : 0;
+        if (hasPinZhong && values.length >= 16 + pinOff) {
           const category = (values[2] || '').trim();
           const typeDisp = (values[3] || '').trim();
           const isOption = category === '期权';
           const instrumentType = instrumentTypeFromDisplayTypeCol(isOption, typeDisp);
-          const sigText = (values[14] || '持有').trim();
+          const sigText = (values[14 + pinOff] || '持有').trim();
           const signal: TradeSignal =
             sigText === '买入' ? 'buy' : sigText === '卖出' ? 'sell' : 'hold';
-          const tpRaw = values[10]?.trim() ?? '';
-          const gwRaw = (values[15] || '').trim();
+          const tpRaw = values[10 + pinOff]?.trim() ?? '';
+          const gwRaw = (values[15 + pinOff] || '').trim();
           newStocks.push({
             symbol: values[0].toUpperCase(),
             name: values[1] || getStockDisplayName(values[0]),
@@ -953,7 +977,7 @@ function importFromCSV(event: Event): void {
                   })()
                 : undefined,
             currentPrice: parseFloat(values[6]) || 0,
-            position: parseFloat(values[8]) || 0,
+            position: parseFloat(values[8 + pinOff]) || 0,
             weight: 0,
             targetPrice:
               tpRaw === ''
@@ -962,19 +986,19 @@ function importFromCSV(event: Event): void {
                     const n = parseFloat(tpRaw);
                     return Number.isFinite(n) ? Math.round(n * 100) / 100 : undefined;
                   })(),
-            optionStrike: values[11] ? parseFloat(values[11]) : undefined,
-            optionExpiry: values[12] || undefined,
-            optionType: (values[13] as 'C' | 'P') || undefined,
+            optionStrike: values[11 + pinOff] ? parseFloat(values[11 + pinOff]) : undefined,
+            optionExpiry: values[12 + pinOff] || undefined,
+            optionType: (values[13 + pinOff] as 'C' | 'P') || undefined,
             signal,
             groupWith: gwRaw === '' ? undefined : gwRaw.toUpperCase()
           });
-        } else if (!hasPinZhong && values.length >= 13) {
+        } else if (!hasPinZhong && values.length >= 13 + pinOff) {
           const { isOption, instrumentType } = parseLegacyCsvTypeColumn(values[2] || '');
-          const sigText = (values[13] || '持有').trim();
+          const sigText = (values[13 + pinOff] || '持有').trim();
           const signal: TradeSignal =
             sigText === '买入' ? 'buy' : sigText === '卖出' ? 'sell' : 'hold';
-          const tpRaw = values[9]?.trim() ?? '';
-          const gwRaw = values.length >= 15 ? (values[14] || '').trim() : '';
+          const tpRaw = values[9 + pinOff]?.trim() ?? '';
+          const gwRaw = values.length >= 15 + pinOff ? (values[14 + pinOff] || '').trim() : '';
           newStocks.push({
             symbol: values[0].toUpperCase(),
             name: values[1] || getStockDisplayName(values[0]),
@@ -989,7 +1013,7 @@ function importFromCSV(event: Event): void {
                   })()
                 : undefined,
             currentPrice: parseFloat(values[5]) || 0,
-            position: parseFloat(values[7]) || 0,
+            position: parseFloat(values[7 + pinOff]) || 0,
             weight: 0,
             targetPrice:
               tpRaw === ''
@@ -998,13 +1022,13 @@ function importFromCSV(event: Event): void {
                     const n = parseFloat(tpRaw);
                     return Number.isFinite(n) ? Math.round(n * 100) / 100 : undefined;
                   })(),
-            optionStrike: values[10] ? parseFloat(values[10]) : undefined,
-            optionExpiry: values[11] || undefined,
-            optionType: (values[12] as 'C' | 'P') || undefined,
+            optionStrike: values[10 + pinOff] ? parseFloat(values[10 + pinOff]) : undefined,
+            optionExpiry: values[11 + pinOff] || undefined,
+            optionType: (values[12 + pinOff] as 'C' | 'P') || undefined,
             signal,
             groupWith: gwRaw === '' ? undefined : gwRaw.toUpperCase()
           });
-        } else if (!hasPinZhong && values.length < 13) {
+        } else if (!hasPinZhong && values.length < 13 + pinOff) {
           const { isOption, instrumentType } = parseLegacyCsvTypeColumn(values[2] || '');
           const tpRaw = values[7]?.trim() ?? '';
           newStocks.push({
@@ -1190,6 +1214,7 @@ function renderHoldingsTableBody(): string {
             </button>
           </td>
           <td style="font-size: 0.9rem;">${formatPnLCell(pnl)}</td>
+          <td style="font-size: 0.9rem;">${formatPnLPercentCell(computeLinePnLPercent(stock))}</td>
           <td style="font-weight: 600; color: #059669;" id="position-${stock.symbol}">$${formatNumber(stock.position)}</td>
           ${weightRowspanTd}
           <td>
@@ -1227,6 +1252,7 @@ function renderHoldingsTableBody(): string {
       <td><span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">现金</span></td>
       <td style="font-weight: 600; color: #a16207;">CASH</td>
       <td style="color: #713f12;">现金</td>
+      <td style="color: #94a3b8;">—</td>
       <td style="color: #94a3b8;">—</td>
       <td style="color: #94a3b8;">—</td>
       <td style="color: #94a3b8;">—</td>
@@ -1567,6 +1593,7 @@ function render(): void {
                 <col class="holdings-col-cost" />
                 <col class="holdings-col-price" />
                 <col class="holdings-col-pnl" />
+                <col class="holdings-col-pnl-pct" />
                 <col class="holdings-col-pos" />
                 <col class="holdings-col-weight" />
                 <col class="holdings-col-target" />
@@ -1585,6 +1612,7 @@ function render(): void {
                   <th title="多笔买入的加权平均成本">成本</th>
                   <th>现价</th>
                   <th>盈亏</th>
+                  <th title="(现价 − 成本) ÷ 成本">盈亏比例</th>
                   <th>持仓</th>
                   <th style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('weight')" title="按同标的合计占总资产比例排序">
                     仓位 / 占比${tableSortKey === 'weight' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}
