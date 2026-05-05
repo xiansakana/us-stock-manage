@@ -935,9 +935,6 @@ async function submitLoginForm(): Promise<void> {
     }
     render();
     void refreshFinnhubCanonicalEquivalents();
-    if (state.stocks.length > 0) {
-      updateStockPrices();
-    }
   } catch {
     if (msg) {
       msg.style.color = '#b91c1c';
@@ -982,9 +979,6 @@ async function submitRegisterForm(): Promise<void> {
     }
     render();
     void refreshFinnhubCanonicalEquivalents();
-    if (state.stocks.length > 0) {
-      updateStockPrices();
-    }
   } catch {
     if (msg) {
       msg.style.color = '#b91c1c';
@@ -1920,9 +1914,6 @@ async function init(): Promise<void> {
   render();
   if (sessionUsername) {
     void refreshFinnhubCanonicalEquivalents();
-    if (state.stocks.length > 0) {
-      updateStockPrices();
-    }
   }
 }
 
