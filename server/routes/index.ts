@@ -1,10 +1,13 @@
 import { Router } from 'express';
+import authRouter from './auth';
 import stocksRouter from './stocks';
+import portfolioRouter from './portfolio';
 
 const router = Router();
 
-// 导入股票路由，添加 /api 前缀
+router.use('/api', authRouter);
 router.use('/api', stocksRouter);
+router.use('/api', portfolioRouter);
 
 // API 路由示例
 router.get('/api/hello', (req, res) => {
