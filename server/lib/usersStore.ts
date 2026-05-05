@@ -2,6 +2,7 @@
 import bcrypt from 'bcryptjs';
 import fs from 'fs/promises';
 import path from 'path';
+import { DATA_ROOT } from './dataRoot';
 
 interface UserRecord {
   username: string;
@@ -13,8 +14,7 @@ interface UsersFileShape {
 }
 
 function usersFilePath(): string {
-  const base = process.env.PORTFOLIO_DATA_DIR?.trim() || path.join(process.cwd(), 'data');
-  return path.join(base, 'users.json');
+  return path.join(DATA_ROOT, 'users.json');
 }
 
 async function readStore(): Promise<UsersFileShape> {

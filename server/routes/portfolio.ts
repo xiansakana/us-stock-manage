@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import fs from 'fs/promises';
 import path from 'path';
+import { DATA_ROOT } from '../lib/dataRoot';
 import { requireAuth } from '../middleware/requireAuth';
 
 const router = Router();
@@ -12,7 +13,7 @@ export interface PortfolioPersistBody {
 }
 
 function dataFilePath(username: string): string {
-  const base = process.env.PORTFOLIO_DATA_DIR?.trim() || path.join(process.cwd(), 'data');
+  const base = DATA_ROOT;
   const safe = username.replace(/[^a-zA-Z0-9_]/g, '');
   if (safe !== username || !safe) {
     throw new Error('invalid username scope');
