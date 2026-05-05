@@ -85,6 +85,142 @@ type TableSortKey = 'symbol' | 'weight';
 let tableSortKey: TableSortKey = 'weight';
 let tableSortDir: 1 | -1 = -1;
 
+/** 持仓表列（用于显示/隐藏） */
+type HoldingsColumnKey =
+  | 'type'
+  | 'symbol'
+  | 'name'
+  | 'shares'
+  | 'cost'
+  | 'price'
+  | 'pnl'
+  | 'pnlPct'
+  | 'position'
+  | 'weight'
+  | 'target'
+  | 'optinfo'
+  | 'signal'
+  | 'actions';
+
+const HOLDINGS_COLUMN_META: ReadonlyArray<{ key: HoldingsColumnKey; label: string }> = [
+  { key: 'type', label: '类型' },
+  { key: 'symbol', label: '代码' },
+  { key: 'name', label: '名称' },
+  { key: 'shares', label: '股数' },
+  { key: 'cost', label: '成本' },
+  { key: 'price', label: '现价' },
+  { key: 'pnl', label: '盈亏' },
+  { key: 'pnlPct', label: '盈亏比例' },
+  { key: 'position', label: '持仓' },
+  { key: 'weight', label: '仓位 / 占比' },
+  { key: 'target', label: '1y目标价' },
+  { key: 'optinfo', label: '期权信息' },
+  { key: 'signal', label: '打分' },
+  { key: 'actions', label: '操作' }
+];
+
+const HOLDINGS_COL_SUFFIX: Record<HoldingsColumnKey, string> = {
+  type: 'type',
+  symbol: 'symbol',
+  name: 'name',
+  shares: 'shares',
+  cost: 'cost',
+  price: 'price',
+  pnl: 'pnl',
+  pnlPct: 'pnl-pct',
+  position: 'pos',
+  weight: 'weight',
+  target: 'target',
+  optinfo: 'optinfo',
+  signal: 'signal',
+  actions: 'actions'
+};
+
+function holdingsCellClass(key: HoldingsColumnKey): string {
+  return `col-h-${HOLDINGS_COL_SUFFIX[key]}`;
+}
+
+function loadColumnVisibility(): Record<HoldingsColumnKey, boolean> {
+  const defaults = (): Record<HoldingsColumnKey, boolean> => {
+    const o = {} as Record<HoldingsColumnKey, boolean>;
+    for (const { key } of HOLDINGS_COLUMN_META) o[key] = true;
+    return o;
+  };
+  try {
+    const raw = localStorage.getItem('portfolioHoldingsColumnVisibility');
+    if (!raw) return defaults();
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const d = defaults();
+    for (const k of Object.keys(d) as HoldingsColumnKey[]) {
+      if (typeof parsed[k] === 'boolean') d[k] = parsed[k];
+    }
+    return d;
+  } catch {
+    return defaults();
+  }
+}
+
+let columnVisibility: Record<HoldingsColumnKey, boolean> = loadColumnVisibility();
+
+function persistColumnVisibility(): void {
+  localStorage.setItem('portfolioHoldingsColumnVisibility', JSON.stringify(columnVisibility));
+}
+
+/** 勾选关闭时仅遮盖单元格数据，列与表头仍保留 */
+const HOLDINGS_DATA_MASK_HTML = '<span class="col-data-masked">—</span>';
+
+function maskOr(key: HoldingsColumnKey, visibleHtml: string): string {
+  return columnVisibility[key] ? visibleHtml : HOLDINGS_DATA_MASK_HTML;
+}
+
+function setHoldingsColumnVisible(key: string, visible: boolean): void {
+  const k = key as HoldingsColumnKey;
+  if (!HOLDINGS_COLUMN_META.some(m => m.key === k)) return;
+  columnVisibility[k] = visible;
+  persistColumnVisibility();
+  render();
+}
+
+const LS_DASHBOARD_SUMMARY_VISIBLE = 'portfolioDashboardSummaryVisible';
+
+function loadDashboardSummaryVisible(): boolean {
+  try {
+    const raw = localStorage.getItem(LS_DASHBOARD_SUMMARY_VISIBLE);
+    if (raw === null) return true;
+    return raw === '1' || raw === 'true';
+  } catch {
+    return true;
+  }
+}
+
+let dashboardSummaryVisible: boolean = loadDashboardSummaryVisible();
+
+function persistDashboardSummaryVisible(): void {
+  localStorage.setItem(LS_DASHBOARD_SUMMARY_VISIBLE, dashboardSummaryVisible ? '1' : '0');
+}
+
+function setDashboardSummaryVisible(visible: boolean): void {
+  dashboardSummaryVisible = visible;
+  persistDashboardSummaryVisible();
+  render();
+}
+
+function renderHoldingsColumnTogglePanel(): string {
+  const boxes = HOLDINGS_COLUMN_META.map(
+    ({ key, label }) => `
+    <label class="holdings-col-toggle-label">
+      <input type="checkbox" ${columnVisibility[key] ? 'checked' : ''}
+             onchange="setHoldingsColumnVisible('${key}', this.checked)" />
+      <span>${escapeHtml(label)}</span>
+    </label>`
+  ).join('');
+  return `
+    <div class="holdings-column-panel">
+      <div class="holdings-column-panel-title">列数据（勾选显示该列数据）</div>
+      <div class="holdings-column-panel-body">${boxes}</div>
+    </div>`;
+}
+
 // Alpha Vantage API
 const ALPHA_VANTAGE_API = 'https://www.alphavantage.co/query';
 const ALPHA_VANTAGE_API_KEY = 'DU6YOC69XS1OR37G';
@@ -1411,91 +1547,119 @@ function renderHoldingsTableBody(): string {
         .filter(Boolean)
         .join(' ');
 
+      const typeInner =
+        stock.type === 'option'
+          ? '<span style="background: #667eea; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">期权</span>'
+          : stock.instrumentType
+            ? `<span style="background: #0ea5e9; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">${escapeHtml(stock.instrumentType)}</span>`
+            : '<span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">股票</span>';
+
+      const sharesInner = `<div style="font-weight: 600;">${formatNumber(stock.shares)}</div>${
+        stock.costLots && stock.costLots.length > 1
+          ? `<div style="font-size: 0.65rem; color: #64748b; margin-top: 2px;">${stock.costLots.length} 笔合计</div>`
+          : ''
+      }`;
+
+      const costInner = `<div style="font-weight: 600;">${
+        stock.avgCost !== undefined && stock.avgCost !== null && !Number.isNaN(Number(stock.avgCost))
+          ? `$${formatNumber(stock.avgCost)}`
+          : '—'
+      }</div>${
+        stock.costLots && stock.costLots.length > 1
+          ? `<div style="font-size: 0.65rem; color: #94a3b8; margin-top: 2px;">加权平均</div>`
+          : ''
+      }`;
+
+      const optinfoInner =
+        stock.type === 'option' && stock.optionStrike
+          ? `${stock.optionType === 'C' ? 'Call' : 'Put'} $${stock.optionStrike}<br/><span style="color: #999;">${stock.optionExpiry || ''}</span>`
+          : '-';
+
       const weightRowspanTd =
         i === 0
-          ? `<td rowspan="${items.length}" style="font-weight: 600; color: #4338ca; vertical-align: middle; text-align: center;" title="同标的合并持仓市值 ÷ 总资产（含现金）">${formatPercent(stock.weight)}</td>`
+          ? `<td rowspan="${items.length}" class="${holdingsCellClass('weight')}" style="font-weight: 600; color: #4338ca; vertical-align: middle; text-align: center;" title="同标的合并持仓市值 ÷ 总资产（含现金）">${maskOr('weight', formatPercent(stock.weight))}</td>`
           : '';
+
+      const symEsc = stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
       rows.push(`
         <tr${trStyles ? ` style="${trStyles}"` : ''}>
-          <td>
-            ${stock.type === 'option'
-              ? '<span style="background: #667eea; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">期权</span>'
-              : stock.instrumentType
-                ? `<span style="background: #0ea5e9; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">${escapeHtml(stock.instrumentType)}</span>`
-                : '<span style="background: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">股票</span>'}
-          </td>
-          <td style="font-weight: 600; color: #667eea; cursor: grab;"
+          <td class="${holdingsCellClass('type')}">${maskOr('type', typeInner)}</td>
+          ${
+            columnVisibility.symbol
+              ? `<td class="${holdingsCellClass('symbol')}" style="font-weight: 600; color: #667eea; cursor: grab;"
               draggable="true"
-              ondragstart="symbolDragStart(event, '${stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')"
+              ondragstart="symbolDragStart(event, '${symEsc}')"
               ondragover="symbolDragOver(event)"
-              ondrop="symbolDropOnRow(event, '${stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')"
+              ondrop="symbolDropOnRow(event, '${symEsc}')"
               ondragend="symbolDragEnd()"
               title="拖动代码到另一条持仓，合并为同一标的">
             <span style="display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap;">
               <span>${stock.symbol}</span>
-              ${stock.groupWith
-                ? `<button type="button" onclick="clearGroupOverride('${stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')" title="恢复自动分组" style="padding: 0 5px; font-size: 0.65rem; border: 1px solid #e5e7eb; border-radius: 4px; background: #fff; cursor: pointer; color: #64748b;">↺</button>`
-                : ''}
+              ${
+                stock.groupWith
+                  ? `<button type="button" onclick="clearGroupOverride('${symEsc}')" title="恢复自动分组" style="padding: 0 5px; font-size: 0.65rem; border: 1px solid #e5e7eb; border-radius: 4px; background: #fff; cursor: pointer; color: #64748b;">↺</button>`
+                  : ''
+              }
             </span>
-          </td>
-          <td>${escapeHtml(stock.name)}</td>
-          <td style="text-align: center; vertical-align: middle;">
-            <div style="font-weight: 600;">${formatNumber(stock.shares)}</div>
-            ${
-              stock.costLots && stock.costLots.length > 1
-                ? `<div style="font-size: 0.65rem; color: #64748b; margin-top: 2px;">${stock.costLots.length} 笔合计</div>`
-                : ''
-            }
-          </td>
-          <td style="text-align: center; vertical-align: middle;">
-            <div style="font-weight: 600;">${
-              stock.avgCost !== undefined && stock.avgCost !== null && !Number.isNaN(Number(stock.avgCost))
-                ? `$${formatNumber(stock.avgCost)}`
-                : '—'
-            }</div>
-            ${
-              stock.costLots && stock.costLots.length > 1
-                ? `<div style="font-size: 0.65rem; color: #94a3b8; margin-top: 2px;">加权平均</div>`
-                : ''
-            }
-          </td>
-          <td style="font-weight: 600;">
+          </td>`
+              : `<td class="${holdingsCellClass('symbol')}" style="color: #94a3b8;">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
+          <td class="${holdingsCellClass('name')}">${maskOr('name', escapeHtml(stock.name))}</td>
+          <td class="${holdingsCellClass('shares')}" style="text-align: center; vertical-align: middle;">${maskOr('shares', sharesInner)}</td>
+          <td class="${holdingsCellClass('cost')}" style="text-align: center; vertical-align: middle;">${maskOr('cost', costInner)}</td>
+          ${
+            columnVisibility.price
+              ? `<td class="${holdingsCellClass('price')}" style="font-weight: 600;">
             <span id="price-${stock.symbol}">$${formatNumber(stock.currentPrice)}</span>
-            <button type="button" onclick="refreshSingleStock('${stock.symbol}')" 
+            <button type="button" onclick="refreshSingleStock('${symEsc}')" 
                     style="margin-left: 4px; padding: 2px 6px; font-size: 0.7rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer;">
               ↻
             </button>
-          </td>
-          <td style="font-size: 0.9rem;">${formatPnLCell(pnl)}</td>
-          <td style="font-size: 0.9rem;">${formatPnLPercentCell(computeLinePnLPercent(stock))}</td>
-          <td style="font-weight: 600; color: #059669;" id="position-${stock.symbol}">$${formatNumber(stock.position)}</td>
+          </td>`
+              : `<td class="${holdingsCellClass('price')}" style="font-weight: 600;">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
+          <td class="${holdingsCellClass('pnl')}" style="font-size: 0.9rem;">${maskOr('pnl', formatPnLCell(pnl))}</td>
+          <td class="${holdingsCellClass('pnlPct')}" style="font-size: 0.9rem;">${maskOr('pnlPct', formatPnLPercentCell(computeLinePnLPercent(stock)))}</td>
+          ${
+            columnVisibility.position
+              ? `<td class="${holdingsCellClass('position')}" style="font-weight: 600; color: #059669;" id="position-${stock.symbol}">$${formatNumber(stock.position)}</td>`
+              : `<td class="${holdingsCellClass('position')}" style="font-weight: 600; color: #059669;">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
           ${weightRowspanTd}
-          <td>
+          ${
+            columnVisibility.target
+              ? `<td class="${holdingsCellClass('target')}">
             <input type="number" value="${formatTargetInputValue(stock.targetPrice)}" placeholder="—"
-                   onchange="updateStock('${stock.symbol}', 'targetPrice', this.value)" 
+                   onchange="updateStock('${symEsc}', 'targetPrice', this.value)" 
                    style="width: 88px; padding: 6px; border: 1px solid #e5e7eb; border-radius: 6px; text-align: center;"
                    step="0.01" min="0" />
-          </td>
-          <td style="font-size: 0.8rem; color: #666;">
-            ${stock.type === 'option' && stock.optionStrike
-              ? `${stock.optionType === 'C' ? 'Call' : 'Put'} $${stock.optionStrike}<br/><span style="color: #999;">${stock.optionExpiry || ''}</span>`
-              : '-'}
-          </td>
-          <td>
-            <select onchange="updateStock('${stock.symbol}', 'signal', this.value)"
+          </td>`
+              : `<td class="${holdingsCellClass('target')}">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
+          <td class="${holdingsCellClass('optinfo')}" style="font-size: 0.8rem; color: #666;">${maskOr('optinfo', optinfoInner)}</td>
+          ${
+            columnVisibility.signal
+              ? `<td class="${holdingsCellClass('signal')}">
+            <select onchange="updateStock('${symEsc}', 'signal', this.value)"
                     style="padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 0.85rem; max-width: 88px;">
               <option value="buy" ${sig === 'buy' ? 'selected' : ''}>买入</option>
               <option value="hold" ${sig === 'hold' ? 'selected' : ''}>持有</option>
               <option value="sell" ${sig === 'sell' ? 'selected' : ''}>卖出</option>
             </select>
-          </td>
-          <td class="holdings-actions-cell">
+          </td>`
+              : `<td class="${holdingsCellClass('signal')}">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
+          ${
+            columnVisibility.actions
+              ? `<td class="holdings-actions-cell ${holdingsCellClass('actions')}">
             <div class="holdings-actions-btns">
-              <button type="button" class="btn btn-secondary holdings-action-btn" title="编辑成本" aria-label="编辑成本" onclick="openCostLotsEditor('${stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">✎</button>
-              <button type="button" class="btn btn-danger holdings-action-btn" title="移除持仓" aria-label="移除持仓" onclick="removeStock('${stock.symbol.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}')">✕</button>
+              <button type="button" class="btn btn-secondary holdings-action-btn" title="编辑成本" aria-label="编辑成本" onclick="openCostLotsEditor('${symEsc}')">✎</button>
+              <button type="button" class="btn btn-danger holdings-action-btn" title="移除持仓" aria-label="移除持仓" onclick="removeStock('${symEsc}')">✕</button>
             </div>
-          </td>
+          </td>`
+              : `<td class="holdings-actions-cell ${holdingsCellClass('actions')}">${HOLDINGS_DATA_MASK_HTML}</td>`
+          }
         </tr>
       `);
     }
@@ -1503,21 +1667,20 @@ function renderHoldingsTableBody(): string {
 
   rows.push(`
     <tr style="background: rgba(234, 179, 8, 0.12);">
-      <td><span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">现金</span></td>
-      <td style="font-weight: 600; color: #a16207;">CASH</td>
-      <td style="color: #713f12;">现金</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="font-weight: 700; color: #0f766e;">$${formatNumber(state.cash)}</td>
-      <td style="font-weight: 700; color: #4338ca;">${formatPercent(cashWeightPct)}</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
-      <td style="color: #94a3b8;">—</td>
+      <td class="${holdingsCellClass('type')}">${maskOr('type', '<span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">现金</span>')}</td>
+      <td class="${holdingsCellClass('symbol')}" style="font-weight: 600; color: #a16207;">${maskOr('symbol', 'CASH')}</td>
+      <td class="${holdingsCellClass('name')}" style="color: #713f12;">${maskOr('name', '现金')}</td>
+      <td class="${holdingsCellClass('shares')}" style="color: #94a3b8;">${maskOr('shares', '—')}</td>
+      <td class="${holdingsCellClass('cost')}" style="color: #94a3b8;">${maskOr('cost', '—')}</td>
+      <td class="${holdingsCellClass('price')}" style="color: #94a3b8;">${maskOr('price', '—')}</td>
+      <td class="${holdingsCellClass('pnl')}" style="color: #94a3b8;">${maskOr('pnl', '—')}</td>
+      <td class="${holdingsCellClass('pnlPct')}" style="color: #94a3b8;">${maskOr('pnlPct', '—')}</td>
+      <td class="${holdingsCellClass('position')}" style="font-weight: 700; color: #0f766e;">${maskOr('position', `$${formatNumber(state.cash)}`)}</td>
+      <td class="${holdingsCellClass('weight')}" style="font-weight: 700; color: #4338ca;">${maskOr('weight', formatPercent(cashWeightPct))}</td>
+      <td class="${holdingsCellClass('target')}" style="color: #94a3b8;">${maskOr('target', '—')}</td>
+      <td class="${holdingsCellClass('optinfo')}" style="color: #94a3b8;">${maskOr('optinfo', '—')}</td>
+      <td class="${holdingsCellClass('signal')}" style="color: #94a3b8;">${maskOr('signal', '—')}</td>
+      <td class="holdings-actions-cell ${holdingsCellClass('actions')}" style="color: #94a3b8;">${maskOr('actions', '—')}</td>
     </tr>
   `);
 
@@ -1805,6 +1968,17 @@ function render(): void {
             <h3 style="margin: 0;">持仓明细</h3>
             <p class="holdings-hint" style="margin: 8px 0 0 0; font-size: 0.82rem; color: #64748b;">拖动「代码」列到另一条持仓，即可合并到同一标的；点击代码旁 ↺ 恢复自动分组。</p>
           </div>
+          ${renderHoldingsColumnTogglePanel()}
+          <div class="dashboard-summary-toggle-row">
+            <label class="holdings-col-toggle-label">
+              <input type="checkbox" ${dashboardSummaryVisible ? 'checked' : ''}
+                     onchange="setDashboardSummaryVisible(this.checked)" />
+              <span>显示顶部看板数据（总资产、市值、盈亏、现金）</span>
+            </label>
+          </div>
+          ${
+            dashboardSummaryVisible
+              ? `
           <div class="summary" style="margin-bottom: 20px;">
             <div class="summary-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
               <h3>总资产</h3>
@@ -1839,7 +2013,7 @@ function render(): void {
                 <span style="font-size: 0.9rem;">$</span>
                 <input type="number" value="${state.cash}" 
                        onchange="updateCash(parseFloat(this.value) || 0)" 
-                       style="width: 90px; padding: 4px 6px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.15); color: white; font-size: 1.1rem; font-weight: 600;"
+                       style="width: 140px; min-width: 120px; padding: 4px 10px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.15); color: white; font-size: 1.1rem; font-weight: 600;"
                        step="0.01" min="0" />
               </div>
               <div style="font-size: 0.72rem; opacity: 0.95; margin-top: 6px;">
@@ -1847,6 +2021,9 @@ function render(): void {
               </div>
             </div>
           </div>
+          `
+              : ''
+          }
           
           <div class="table-container">
             <table class="holdings-table">
@@ -1868,24 +2045,24 @@ function render(): void {
               </colgroup>
               <thead>
                 <tr>
-                  <th>类型</th>
-                  <th style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('symbol')" title="按标的代码排序">
+                  <th class="${holdingsCellClass('type')}">类型</th>
+                  <th class="${holdingsCellClass('symbol')}" style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('symbol')" title="按标的代码排序">
                     代码${tableSortKey === 'symbol' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}
                   </th>
-                  <th>名称</th>
-                  <th title="多笔买入合计股数/张数，见「编辑」">股数</th>
-                  <th title="多笔买入的加权平均成本">成本</th>
-                  <th>现价</th>
-                  <th>盈亏</th>
-                  <th title="(现价 − 成本) ÷ 成本">盈亏比例</th>
-                  <th>持仓</th>
-                  <th style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('weight')" title="按同标的合计占总资产比例排序">
+                  <th class="${holdingsCellClass('name')}">名称</th>
+                  <th class="${holdingsCellClass('shares')}" title="多笔买入合计股数/张数，见「编辑」">股数</th>
+                  <th class="${holdingsCellClass('cost')}" title="多笔买入的加权平均成本">成本</th>
+                  <th class="${holdingsCellClass('price')}">现价</th>
+                  <th class="${holdingsCellClass('pnl')}">盈亏</th>
+                  <th class="${holdingsCellClass('pnlPct')}" title="(现价 − 成本) ÷ 成本">盈亏比例</th>
+                  <th class="${holdingsCellClass('position')}">持仓</th>
+                  <th class="${holdingsCellClass('weight')}" style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('weight')" title="按同标的合计占总资产比例排序">
                     仓位 / 占比${tableSortKey === 'weight' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}
                   </th>
-                  <th>1y目标价</th>
-                  <th>期权信息</th>
-                  <th>打分</th>
-                  <th>操作</th>
+                  <th class="${holdingsCellClass('target')}">1y目标价</th>
+                  <th class="${holdingsCellClass('optinfo')}">期权信息</th>
+                  <th class="${holdingsCellClass('signal')}">打分</th>
+                  <th class="${holdingsCellClass('actions')}">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -1943,6 +2120,8 @@ void init();
 (window as any).submitLoginForm = submitLoginForm;
 (window as any).submitRegisterForm = submitRegisterForm;
 (window as any).logoutApp = logoutApp;
+(window as any).setHoldingsColumnVisible = setHoldingsColumnVisible;
+(window as any).setDashboardSummaryVisible = setDashboardSummaryVisible;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
