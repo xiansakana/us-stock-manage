@@ -199,7 +199,7 @@ table.holdings-table col.holdings-col-symbol {
   width: 10%;
 }
 table.holdings-table col.holdings-col-name {
-  width: 19%;
+  width: 14%;
 }
 table.holdings-table col.holdings-col-shares {
   width: 5%;
@@ -212,6 +212,9 @@ table.holdings-table col.holdings-col-price {
 }
 table.holdings-table col.holdings-col-pnl {
   width: 6%;
+}
+table.holdings-table col.holdings-col-pnl-pct {
+  width: 5%;
 }
 table.holdings-table col.holdings-col-pos {
   width: 7%;
@@ -451,7 +454,7 @@ table.holdings-table tbody tr:nth-child(even):hover {
   }
 
   table.holdings-table {
-    min-width: 880px;
+    min-width: 940px;
   }
 
   .holdings-hint {
@@ -552,7 +555,7 @@ table.holdings-table tbody tr:nth-child(even):hover {
 
   table.holdings-table {
     font-size: 0.78rem;
-    min-width: 860px;
+    min-width: 920px;
   }
 
   table.holdings-table th,
@@ -602,7 +605,7 @@ table.holdings-table tbody tr:nth-child(even):hover {
 
   table.holdings-table {
     font-size: 0.72rem;
-    min-width: 820px;
+    min-width: 880px;
   }
 
   .holdings-hint {
