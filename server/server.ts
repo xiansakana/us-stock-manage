@@ -1,7 +1,9 @@
 // ABOUTME: Express server with Vite integration
 // ABOUTME: Handles API routes and serves frontend in dev/prod modes
 
+import 'dotenv/config';
 import { createServer, type Server } from 'http';
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import router from './routes/index';
 import { setupVite } from './vite';
@@ -10,6 +12,9 @@ const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
 const hostname = process.env.HOSTNAME || 'localhost';
 const app = express();
+if (process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true') {
+  app.set('trust proxy', 1);
+}
 // 使用 http.createServer 包装 Express app，以便支持 WebSocket 等协议升级
 const server = createServer(app);
 
@@ -29,6 +34,7 @@ async function startServer(): Promise<Server> {
   // 添加请求体解析
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
+  app.use(cookieParser());
 
   // 注册 API 路由 - 必须在 Vite middleware 之前注册
   app.use(router);

@@ -76,6 +76,10 @@ const state: AppState = {
   error: ''
 };
 
+/** 当前登录用户名；null 表示未登录，仅展示登录/注册页 */
+let sessionUsername: string | null = null;
+let authPanelTab: 'login' | 'register' = 'login';
+
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
 let tableSortKey: TableSortKey = 'weight';
@@ -91,6 +95,9 @@ function getStockDisplayName(ticker: string): string {
 }
 
 const FINNHUB_EQ_LS_KEY = 'portfolioFinnhubUnderlyingEq';
+
+/** 旧版浏览器本地持仓键；启动时若服务端无数据则迁移一次并删除 */
+const LS_PORTFOLIO_KEY = 'stockPortfolio';
 
 /** Finnhub /symbol/canonical-underlying 推断结果缓存（含「映射为自身」以避免重复请求） */
 function loadFinnhubUnderlyingEqCache(): Record<string, string> {
@@ -697,9 +704,26 @@ function calculateTotals(): void {
   });
 }
 
-// 函数：保存到 localStorage
-function saveToStorage(): void {
-  const data = {
+function buildPortfolioPayload(): {
+  stocks: Array<{
+    symbol: string;
+    name: string;
+    shares: number;
+    targetPrice?: number;
+    avgCost?: number;
+    signal?: TradeSignal;
+    groupWith?: string;
+    currentPrice: number;
+    type?: 'stock' | 'option';
+    optionStrike?: number;
+    optionExpiry?: string;
+    optionType?: 'C' | 'P';
+    instrumentType?: string;
+    costLots?: CostLot[];
+  }>;
+  cash: number;
+} {
+  return {
     stocks: state.stocks.map(s => ({
       symbol: s.symbol,
       name: s.name,
@@ -718,7 +742,268 @@ function saveToStorage(): void {
     })),
     cash: state.cash
   };
-  localStorage.setItem('stockPortfolio', JSON.stringify(data));
+}
+
+let persistDebounceId: ReturnType<typeof setTimeout> | null = null;
+const PERSIST_DEBOUNCE_MS = 400;
+
+/** 防抖写入服务端按用户分文件（需登录 Cookie） */
+function saveToStorage(): void {
+  if (!sessionUsername) return;
+  const data = buildPortfolioPayload();
+  if (persistDebounceId !== null) clearTimeout(persistDebounceId);
+  persistDebounceId = setTimeout(() => {
+    persistDebounceId = null;
+    void (async () => {
+      try {
+        const res = await fetch('/api/portfolio', {
+          method: 'PUT',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        });
+        if (res.status === 401) {
+          sessionUsername = null;
+          state.stocks = [];
+          state.cash = 0;
+          calculateTotals();
+          render();
+          return;
+        }
+        if (!res.ok) console.error('同步到服务器失败:', res.status);
+      } catch (e) {
+        console.error('同步到服务器失败:', e);
+      }
+    })();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+function applyPortfolioFromParsed(parsed: { stocks: unknown; cash?: unknown }): void {
+  if (!Array.isArray(parsed.stocks)) return;
+  state.stocks = parsed.stocks.map((s: Record<string, unknown>) => {
+    const sym = String(s.symbol ?? '').toUpperCase();
+    const inferredOption = isOptionSymbol(sym);
+    return {
+      ...(s as unknown as Stock),
+      symbol: sym,
+      type: (s.type as Stock['type']) ?? (inferredOption ? 'option' : 'stock'),
+      position: 0,
+      weight: 0
+    };
+  });
+  const c = parsed.cash;
+  state.cash = typeof c === 'number' && Number.isFinite(c) ? c : 0;
+  calculateTotals();
+}
+
+async function loadPortfolioOnStartup(): Promise<void> {
+  if (!sessionUsername) return;
+  try {
+    const res = await fetch('/api/portfolio', { credentials: 'include' });
+    if (res.status === 401) {
+      sessionUsername = null;
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const parsed = (await res.json()) as { stocks?: unknown; cash?: unknown };
+    const stocksArr = Array.isArray(parsed.stocks) ? parsed.stocks : [];
+    const cashNum = typeof parsed.cash === 'number' && Number.isFinite(parsed.cash) ? parsed.cash : 0;
+    const hasServerData = stocksArr.length > 0 || cashNum !== 0;
+    if (hasServerData) {
+      applyPortfolioFromParsed({ stocks: stocksArr, cash: cashNum });
+      return;
+    }
+  } catch (e) {
+    console.warn('从服务器加载持仓失败:', e);
+  }
+  try {
+    const raw = localStorage.getItem(LS_PORTFOLIO_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as { stocks?: unknown; cash?: unknown };
+    if (!Array.isArray(parsed.stocks) || parsed.stocks.length === 0) return;
+    applyPortfolioFromParsed({ stocks: parsed.stocks, cash: parsed.cash });
+    localStorage.removeItem(LS_PORTFOLIO_KEY);
+    await fetch('/api/portfolio', {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildPortfolioPayload())
+    }).catch(() => {});
+  } catch (e) {
+    console.error('读取本地旧持仓失败:', e);
+  }
+}
+
+async function refreshSession(): Promise<void> {
+  try {
+    const r = await fetch('/api/auth/me', { credentials: 'include' });
+    if (r.ok) {
+      const j = (await r.json()) as { username?: string };
+      sessionUsername = typeof j.username === 'string' ? j.username : null;
+    } else {
+      sessionUsername = null;
+    }
+  } catch {
+    sessionUsername = null;
+  }
+}
+
+function renderAuthScreen(): string {
+  const tab = authPanelTab;
+  const loginForm = `
+    <form onsubmit="event.preventDefault(); submitLoginForm(); return false;">
+      <div class="input-group" style="margin-bottom:14px;">
+        <label for="auth-user">用户名</label>
+        <input type="text" id="auth-user" autocomplete="username" required maxlength="32" pattern="[a-zA-Z0-9_]{3,32}" placeholder="3–32 位字母、数字或下划线" />
+      </div>
+      <div class="input-group" style="margin-bottom:18px;">
+        <label for="auth-pass">密码</label>
+        <input type="password" id="auth-pass" autocomplete="current-password" required minlength="8" maxlength="128" placeholder="至少 8 位" />
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;">登录</button>
+    </form>
+  `;
+  const registerForm = `
+    <form onsubmit="event.preventDefault(); submitRegisterForm(); return false;">
+      <div class="input-group" style="margin-bottom:14px;">
+        <label for="auth-user">用户名</label>
+        <input type="text" id="auth-user" autocomplete="username" required maxlength="32" pattern="[a-zA-Z0-9_]{3,32}" placeholder="3–32 位字母、数字或下划线" />
+      </div>
+      <div class="input-group" style="margin-bottom:18px;">
+        <label for="auth-pass">密码</label>
+        <input type="password" id="auth-pass" autocomplete="new-password" required minlength="8" maxlength="128" placeholder="至少 8 位" />
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;">注册并登录</button>
+    </form>
+  `;
+  return `
+    <div class="container">
+      <div class="header">
+        <h1>美股持仓管理</h1>
+        <p>登录后持仓保存在服务器；不同账户数据隔离</p>
+      </div>
+      <div class="card" style="max-width: 440px; margin: 0 auto;">
+        <div style="display:flex; gap:10px; margin-bottom: 22px;">
+          <button type="button" class="btn ${tab === 'login' ? 'btn-primary' : 'btn-secondary'}" onclick="switchAuthTab('login')" style="flex:1;">登录</button>
+          <button type="button" class="btn ${tab === 'register' ? 'btn-primary' : 'btn-secondary'}" onclick="switchAuthTab('register')" style="flex:1;">注册</button>
+        </div>
+        ${tab === 'login' ? loginForm : registerForm}
+        <p id="auth-msg" style="margin-top:14px;font-size:0.9rem;min-height:1.3em;"></p>
+      </div>
+    </div>
+  `;
+}
+
+function switchAuthTab(tab: 'login' | 'register'): void {
+  authPanelTab = tab;
+  render();
+}
+
+async function submitLoginForm(): Promise<void> {
+  const userEl = document.getElementById('auth-user') as HTMLInputElement | null;
+  const passEl = document.getElementById('auth-pass') as HTMLInputElement | null;
+  const msg = document.getElementById('auth-msg');
+  const u = userEl?.value?.trim() ?? '';
+  const p = passEl?.value ?? '';
+  if (!u || !p) {
+    if (msg) {
+      msg.style.color = '#b91c1c';
+      msg.textContent = '请填写用户名和密码';
+    }
+    return;
+  }
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: string; username?: string };
+    if (!res.ok) {
+      if (msg) {
+        msg.style.color = '#b91c1c';
+        msg.textContent = data.error || '登录失败';
+      }
+      return;
+    }
+    sessionUsername = typeof data.username === 'string' ? data.username : u;
+    await loadPortfolioOnStartup();
+    if (msg) {
+      msg.textContent = '';
+      msg.style.color = '';
+    }
+    render();
+    void refreshFinnhubCanonicalEquivalents();
+    if (state.stocks.length > 0) {
+      updateStockPrices();
+    }
+  } catch {
+    if (msg) {
+      msg.style.color = '#b91c1c';
+      msg.textContent = '网络错误，请稍后重试';
+    }
+  }
+}
+
+async function submitRegisterForm(): Promise<void> {
+  const userEl = document.getElementById('auth-user') as HTMLInputElement | null;
+  const passEl = document.getElementById('auth-pass') as HTMLInputElement | null;
+  const msg = document.getElementById('auth-msg');
+  const u = userEl?.value?.trim() ?? '';
+  const p = passEl?.value ?? '';
+  if (!u || !p) {
+    if (msg) {
+      msg.style.color = '#b91c1c';
+      msg.textContent = '请填写用户名和密码';
+    }
+    return;
+  }
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: string; username?: string };
+    if (!res.ok) {
+      if (msg) {
+        msg.style.color = '#b91c1c';
+        msg.textContent = data.error || '注册失败';
+      }
+      return;
+    }
+    sessionUsername = typeof data.username === 'string' ? data.username : u;
+    await loadPortfolioOnStartup();
+    if (msg) {
+      msg.textContent = '';
+      msg.style.color = '';
+    }
+    render();
+    void refreshFinnhubCanonicalEquivalents();
+    if (state.stocks.length > 0) {
+      updateStockPrices();
+    }
+  } catch {
+    if (msg) {
+      msg.style.color = '#b91c1c';
+      msg.textContent = '网络错误，请稍后重试';
+    }
+  }
+}
+
+async function logoutApp(): Promise<void> {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+  } catch {
+    /* ignore */
+  }
+  sessionUsername = null;
+  state.stocks = [];
+  state.cash = 0;
+  calculateTotals();
+  render();
 }
 
 // 导出数据为 JSON 文件
@@ -1078,31 +1363,6 @@ function importFromCSV(event: Event): void {
   };
   reader.readAsText(file);
   input.value = '';
-}
-
-// 函数：从 localStorage 加载
-function loadFromStorage(): void {
-  try {
-    const data = localStorage.getItem('stockPortfolio');
-    if (data) {
-      const parsed = JSON.parse(data);
-      state.stocks = parsed.stocks.map((s: any) => {
-        const sym = String(s.symbol ?? '').toUpperCase();
-        const inferredOption = isOptionSymbol(sym);
-        return {
-          ...s,
-          symbol: sym,
-          type: s.type ?? (inferredOption ? 'option' : 'stock'),
-          position: 0,
-          weight: 0
-        };
-      });
-      state.cash = parsed.cash || 0;
-      calculateTotals();
-    }
-  } catch (error) {
-    console.error('加载数据失败:', error);
-  }
 }
 
 function getGroupPortfolioPercent(
@@ -1475,12 +1735,23 @@ function updateStock(symbol: string, field: string, value: string | number): voi
 function render(): void {
   const app = document.getElementById('app');
   if (!app) return;
-  
+
+  if (!sessionUsername) {
+    app.innerHTML = renderAuthScreen();
+    return;
+  }
+
   app.innerHTML = `
     <div class="container">
-      <div class="header">
-        <h1>美股持仓管理</h1>
-        <p>实时查询股票价格，计算持仓和仓位</p>
+      <div class="header" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 16px; margin-bottom: 30px;">
+        <div style="text-align: center; flex: 1; min-width: 220px;">
+          <h1>美股持仓管理</h1>
+          <p>实时查询股票价格，计算持仓和仓位</p>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span style="color: white; opacity: 0.92; font-size: 0.95rem;">${sessionUsername}</span>
+          <button type="button" class="btn btn-secondary" onclick="logoutApp()" style="padding: 8px 16px; font-size: 0.9rem;">退出</button>
+        </div>
       </div>
       
       <div class="card">
@@ -1640,24 +1911,22 @@ function render(): void {
   setupStockSearchEvents();
 }
 
-// 初始化应用
-function init(): void {
-  loadFromStorage();
+// 初始化应用（会话 → 持仓；未登录仅展示登录页）
+async function init(): Promise<void> {
+  await refreshSession();
+  if (sessionUsername) {
+    await loadPortfolioOnStartup();
+  }
   render();
-
-  // 设置下拉搜索事件
-  setupStockSearchEvents();
-
-  void refreshFinnhubCanonicalEquivalents();
-
-  // 页面加载时自动更新价格
-  if (state.stocks.length > 0) {
-    updateStockPrices();
+  if (sessionUsername) {
+    void refreshFinnhubCanonicalEquivalents();
+    if (state.stocks.length > 0) {
+      updateStockPrices();
+    }
   }
 }
 
-// 启动应用
-init();
+void init();
 
 // 暴露全局函数供 HTML 调用
 (window as any).addStock = addStock;
@@ -1679,6 +1948,10 @@ init();
 (window as any).importFromCSV = importFromCSV;
 (window as any).highlightSuggestion = highlightSuggestion;
 (window as any).openCostLotsEditor = openCostLotsEditor;
+(window as any).switchAuthTab = switchAuthTab;
+(window as any).submitLoginForm = submitLoginForm;
+(window as any).submitRegisterForm = submitRegisterForm;
+(window as any).logoutApp = logoutApp;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
