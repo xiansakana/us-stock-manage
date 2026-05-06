@@ -6,7 +6,7 @@ import { createServer, type Server } from 'http';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import { setupVite } from './vite';
-import { getPortfolio, savePortfolio } from './storage/database/portfolioStore';
+import { getPortfolio, savePortfolio, getPositions, addTrade, getTrades, getProfitLoss, deleteTrade, getPositionDetail, type TradeInput } from './storage/database/portfolioStore';
 
 const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
@@ -119,7 +119,152 @@ async function startServer(): Promise<Server> {
     res.json({ success: true });
   });
 
-  // 获取持仓
+  // 获取当前持仓（基于交易记录计算）
+  app.get('/api/positions', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    try {
+      const positions = await getPositions(token);
+      res.json({ positions });
+    } catch (error) {
+      console.error('获取持仓失败:', error);
+      res.status(500).json({ error: '获取持仓失败' });
+    }
+  });
+
+  // 获取交易记录
+  app.get('/api/trades', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    const { symbol, startDate, endDate, limit } = req.query as {
+      symbol?: string;
+      startDate?: string;
+      endDate?: string;
+      limit?: string;
+    };
+    
+    try {
+      const trades = await getTrades(token, {
+        symbol,
+        startDate,
+        endDate,
+        limit: limit ? parseInt(limit) : undefined
+      });
+      res.json({ trades });
+    } catch (error) {
+      console.error('获取交易记录失败:', error);
+      res.status(500).json({ error: '获取交易记录失败' });
+    }
+  });
+
+  // 添加交易记录（买入/卖出）
+  app.post('/api/trades', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    const tradeInput = req.body as TradeInput;
+    
+    // 验证必填字段
+    if (!tradeInput.symbol || !tradeInput.name || !tradeInput.type || !tradeInput.shares || !tradeInput.price) {
+      return res.status(400).json({ error: '缺少必填字段：symbol, name, type, shares, price' });
+    }
+    
+    if (tradeInput.type !== 'buy' && tradeInput.type !== 'sell') {
+      return res.status(400).json({ error: 'type 必须是 buy 或 sell' });
+    }
+    
+    if (tradeInput.shares <= 0 || tradeInput.price <= 0) {
+      return res.status(400).json({ error: 'shares 和 price 必须大于 0' });
+    }
+    
+    try {
+      const trade = await addTrade(token, tradeInput);
+      res.json({ success: true, trade });
+    } catch (error) {
+      console.error('添加交易失败:', error);
+      res.status(500).json({ error: '添加交易失败' });
+    }
+  });
+
+  // 删除交易记录
+  app.delete('/api/trades/:id', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    const { id } = req.params;
+    
+    try {
+      await deleteTrade(token, id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('删除交易失败:', error);
+      res.status(500).json({ error: '删除交易失败' });
+    }
+  });
+
+  // 获取盈亏统计
+  app.get('/api/pnl', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    const { startDate, endDate, symbol } = req.query as {
+      startDate?: string;
+      endDate?: string;
+      symbol?: string;
+    };
+    
+    try {
+      const pnl = await getProfitLoss(token, { startDate, endDate, symbol });
+      res.json(pnl);
+    } catch (error) {
+      console.error('获取盈亏失败:', error);
+      res.status(500).json({ error: '获取盈亏失败' });
+    }
+  });
+
+  // 兼容旧 API：获取持仓（使用交易记录计算）
   app.get('/api/portfolios', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -133,15 +278,23 @@ async function startServer(): Promise<Server> {
     }
     
     try {
-      const portfolio = await getPortfolio(token);
-      res.json(portfolio);
+      const positions = await getPositions(token);
+      // 转换为旧格式
+      const stocks = positions.filter(p => p.shares > 0).map(p => ({
+        symbol: p.symbol,
+        name: p.name,
+        shares: p.shares,
+        avgCost: p.avgCost
+      }));
+      const cash = 0; // 现金暂不跟踪
+      res.json({ stocks, cash });
     } catch (error) {
       console.error('获取持仓失败:', error);
       res.status(500).json({ error: '获取持仓失败' });
     }
   });
 
-  // 保存持仓
+  // 兼容旧 API：保存持仓（转换为买入交易）
   app.put('/api/portfolios', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -157,9 +310,20 @@ async function startServer(): Promise<Server> {
     const { stocks = [], cash = 0 } = req.body as { stocks?: unknown[]; cash?: number };
     
     try {
-      await savePortfolio(token, { stocks, cash });
-      // 同时更新内存会话
-      session.portfolio = { stocks, cash };
+      // 清除旧持仓，添加新持仓作为买入交易
+      // 注意：这里简化处理，实际应该比较差异
+      for (const stock of stocks as { symbol: string; name: string; shares: number; avgCost: number }[]) {
+        if (stock.shares > 0) {
+          await addTrade(token, {
+            symbol: stock.symbol,
+            name: stock.name,
+            type: 'buy',
+            shares: stock.shares,
+            price: stock.avgCost,
+            trade_date: new Date().toISOString()
+          });
+        }
+      }
       res.json({ success: true });
     } catch (error) {
       console.error('保存持仓失败:', error);

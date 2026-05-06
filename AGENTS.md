@@ -95,19 +95,25 @@ bash scripts/start.sh
 
 ### 数据库持久化
 
-持仓数据使用 Supabase PostgreSQL 存储：
+交易记录使用 Supabase PostgreSQL 存储：
 
 **表结构：**
-- `portfolios` - 用户持仓主表（user_id, cash, created_at, updated_at）
-- `portfolio_stocks` - 用户持仓股票表（portfolio_id, symbol, name, shares, avg_cost）
+- `trades` - 交易记录表（id, user_id, symbol, name, type, shares, price, total_amount, commission, trade_date, created_at）
 
 **客户端：**
-- `server/storage/database/supabase-client.ts` - Supabase 客户端（使用 service_role_key 绕过 RLS）
-- `server/storage/database/portfolioStore.ts` - 持仓 CRUD 操作
+- `server/storage/database/supabase-client.ts` - Supabase 客户端
+- `server/storage/database/portfolioStore.ts` - 交易与持仓操作
 
-**数据访问：**
-- `getPortfolio(userId)` - 获取用户持仓
-- `savePortfolio(userId, data)` - 保存用户持仓
-- `deletePortfolio(userId)` - 删除用户持仓
+**API 接口：**
+- `POST /api/trades` - 添加交易（买入/卖出）
+- `GET /api/trades` - 获取交易历史（支持 symbol, startDate, endDate, limit 参数）
+- `GET /api/positions` - 获取当前持仓（基于交易记录计算）
+- `GET /api/pnl` - 获取盈亏统计（支持时间范围和股票筛选）
+- `DELETE /api/trades/:id` - 删除交易记录
+
+**盈亏计算：**
+- 使用 FIFO（先进先出）法计算已实现盈亏
+- 支持时间段查询历史盈亏
+- 按股票或全部汇总
 
 **注意：** Session（登录状态）仍存储在内存中，服务重启后需重新登录。
