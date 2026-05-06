@@ -1,45 +1,52 @@
-// 持仓组合服务端持久化（使用内存存储演示）
+// 持仓组合服务端持久化（JSON 文件存储）
 import { Router } from 'express';
+import { getPortfolio, savePortfolio, type PortfolioData } from '../storage/portfolioStore';
 
 const router = Router();
 
-// 内存持仓存储
-const portfolios = new Map<string, { stocks: unknown[]; cash: number }>();
+// 持仓数据结构
+interface Stock {
+  symbol: string;
+  name: string;
+  shares: number;
+  avgCost: number;
+}
 
 // 获取持仓
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: '未登录' });
   }
   
   const token = authHeader.slice(7);
-  // 简单验证：使用 token 作为 userId
-  const portfolio = portfolios.get(token);
-  if (!portfolio) {
-    return res.json({ stocks: [], cash: 0 });
-  }
   
-  res.json(portfolio);
+  try {
+    const portfolio = await getPortfolio(token);
+    res.json(portfolio);
+  } catch (error) {
+    console.error('获取持仓失败:', error);
+    res.status(500).json({ error: '获取持仓失败' });
+  }
 });
 
 // 保存持仓
-router.put('/', (req, res) => {
+router.put('/', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: '未登录' });
   }
   
   const token = authHeader.slice(7);
-  const { stocks = [], cash = 0 } = req.body as { stocks?: unknown[]; cash?: number };
+  const { stocks = [], cash = 0 } = req.body as PortfolioData;
   
-  portfolios.set(token, {
-    stocks,
-    cash
-  });
-  
-  console.log(`保存持仓: ${token.substring(0, 8)}..., ${stocks.length} 个持仓`);
-  res.json({ success: true });
+  try {
+    await savePortfolio(token, { stocks, cash });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('保存持仓失败:', error);
+    res.status(500).json({ error: '保存持仓失败' });
+  }
 });
 
 export default router;
