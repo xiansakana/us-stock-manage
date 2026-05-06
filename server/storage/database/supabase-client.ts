@@ -1,129 +1,128 @@
-// Supabase client singleton
-interface SupabaseClient {
-  auth: {
-    signUp: (options: { email: string; password: string }) => Promise<{ data: { user?: { id: string; email?: string }; session?: { access_token: string } }; error?: { message: string } }>;
-    signInWithPassword: (options: { email: string; password: string }) => Promise<{ data: { user?: { id: string; email?: string }; session?: { access_token: string } }; error?: { message: string } }>;
-    signOut: () => Promise<{ error?: { message: string } }>;
-    getSession: () => Promise<{ data: { session: { access_token: string; user: { id: string; email?: string } } | null }; error?: { message: string } }>;
-  };
-  from: (table: string) => {
-    select: (columns?: string) => { eq: (col: string, val: unknown) => Promise<{ data: unknown; error?: { message: string } }>; data?: unknown };
-    insert: (data: unknown) => Promise<{ error?: { message: string } }>;
-    upsert: (data: unknown) => Promise<{ error?: { message: string } }>;
-    delete: () => { eq: (col: string, val: unknown) => Promise<{ error?: { message: string } }> };
-    update: (data: unknown) => { eq: (col: string, val: unknown) => Promise<{ error?: { message: string } }> };
-  };
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { execSync } from 'child_process';
+import { getReportBuffer, createWrappedFetch } from 'coze-coding-dev-sdk';
+
+let envLoaded = false;
+
+interface SupabaseCredentials {
+  url: string;
+  anonKey: string;
 }
 
-let client: SupabaseClient | null = null;
-
-export function getSupabaseClient(): SupabaseClient {
-  if (!client) {
-    const supabaseUrl = process.env.SUPABASE_URL || 'https://placeholder.supabase.co';
-    const supabaseKey = process.env.SUPABASE_ANON_KEY || 'placeholder-key';
-    
-    // 使用全局 fetch API
-    client = createSupabaseClient(supabaseUrl, supabaseKey);
+function loadEnv(): void {
+  if (envLoaded || (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY)) {
+    return;
   }
-  return client;
-}
 
-function createSupabaseClient(url: string, key: string): SupabaseClient {
-  const headers = {
-    'apikey': key,
-    'Authorization': `Bearer ${key}`,
-    'Content-Type': 'application/json'
-  };
-
-  return {
-    auth: {
-      signUp: async ({ email, password }) => {
-        const res = await fetch(`${url}/auth/v1/signup`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ email, password })
-        });
-        const data = await res.json();
-        return { data, error: data.error };
-      },
-      signInWithPassword: async ({ email, password }) => {
-        const res = await fetch(`${url}/auth/v1/token?grant_type=password`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ email, password })
-        });
-        const data = await res.json();
-        if (data.error) return { data: {}, error: data.error };
-        return {
-          data: {
-            user: { id: data.user_id, email },
-            session: { access_token: data.access_token }
-          }
-        };
-      },
-      signOut: async () => {
-        const res = await fetch(`${url}/auth/v1/logout`, {
-          method: 'POST',
-          headers
-        });
-        const data = await res.json();
-        return { error: data.error };
-      },
-      getSession: async () => {
-        const res = await fetch(`${url}/auth/v1/session`, { headers });
-        const data = await res.json();
-        if (data.error) return { data: { session: null }, error: data.error };
-        return { data: { session: data } };
+  try {
+    try {
+      require('dotenv').config();
+      if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
+        envLoaded = true;
+        return;
       }
-    },
-    from: (table: string) => ({
-      select: (columns = '*') => ({
-        eq: async (col: string, val: unknown) => {
-          const res = await fetch(`${url}/rest/v1/${table}?${col}=eq.${val}&select=${columns}`, { headers });
-          const data = await res.json();
-          return { data, error: data.error };
-        },
-        data: undefined as unknown
-      }),
-      insert: async (data: unknown) => {
-        const res = await fetch(`${url}/rest/v1/${table}`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(data)
-        });
-        const result = await res.json();
-        return { error: result.error };
-      },
-      upsert: async (data: unknown) => {
-        const res = await fetch(`${url}/rest/v1/${table}?select=*`, {
-          method: 'POST',
-          headers: { ...headers, 'Prefer': 'resolution=merge-duplicates' },
-          body: JSON.stringify(data)
-        });
-        const result = await res.json();
-        return { error: result.error };
-      },
-      delete: () => ({
-        eq: async (col: string, val: unknown) => {
-          const res = await fetch(`${url}/rest/v1/${table}?${col}=eq.${val}`, {
-            method: 'DELETE',
-            headers
-          });
-          const result = await res.json();
-          return { error: result.error };
+    } catch {
+      // dotenv not available
+    }
+
+    const pythonCode = `
+import os
+import sys
+try:
+    from coze_workload_identity import Client
+    client = Client()
+    env_vars = client.get_project_env_vars()
+    client.close()
+    for env_var in env_vars:
+        print(f"{env_var.key}={env_var.value}")
+except Exception as e:
+    print(f"# Error: {e}", file=sys.stderr)
+`;
+
+    const output = execSync(`python3 -c '${pythonCode.replace(/'/g, "'\"'\"'")}'`, {
+      encoding: 'utf-8',
+      timeout: 10000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const lines = output.trim().split('\n');
+    for (const line of lines) {
+      if (line.startsWith('#')) continue;
+      const eqIndex = line.indexOf('=');
+      if (eqIndex > 0) {
+        const key = line.substring(0, eqIndex);
+        let value = line.substring(eqIndex + 1);
+        if ((value.startsWith("'") && value.endsWith("'")) ||
+            (value.startsWith('"') && value.endsWith('"'))) {
+          value = value.slice(1, -1);
         }
-      }),
-      update: (data: unknown) => ({
-        eq: async (col: string, val: unknown) => {
-          const res = await fetch(`${url}/rest/v1/${table}?${col}=eq.${val}`, {
-            method: 'PATCH',
-            headers,
-            body: JSON.stringify(data)
-          });
-          const result = await res.json();
-          return { error: result.error };
+        if (!process.env[key]) {
+          process.env[key] = value;
         }
-      })
-    })
-  };
+      }
+    }
+
+    envLoaded = true;
+  } catch {
+    // Silently fail
+  }
 }
+
+function getSupabaseCredentials(): SupabaseCredentials {
+  loadEnv();
+
+  const url = process.env.COZE_SUPABASE_URL;
+  const anonKey = process.env.COZE_SUPABASE_ANON_KEY;
+
+  if (!url) {
+    throw new Error('COZE_SUPABASE_URL is not set');
+  }
+  if (!anonKey) {
+    throw new Error('COZE_SUPABASE_ANON_KEY is not set');
+  }
+
+  return { url, anonKey };
+}
+
+function getSupabaseServiceRoleKey(): string | undefined {
+  loadEnv();
+  return process.env.COZE_SUPABASE_SERVICE_ROLE_KEY;
+}
+
+function getSupabaseClient(token?: string): SupabaseClient {
+  const { url, anonKey } = getSupabaseCredentials();
+
+  let key: string;
+  if (token) {
+    key = anonKey;
+  } else {
+    const serviceRoleKey = getSupabaseServiceRoleKey();
+    key = serviceRoleKey ?? anonKey;
+  }
+
+  const globalOptions: Record<string, any> = {};
+  if (token) {
+    globalOptions.headers = { Authorization: `Bearer ${token}` };
+  }
+  try {
+    const buffer = getReportBuffer();
+    if (buffer) {
+      globalOptions.fetch = createWrappedFetch(buffer, 'supabase');
+    }
+  } catch {
+    // Silent — reporting setup failure should not block client creation
+  }
+
+  return createClient(url, key, {
+    global: globalOptions,
+    db: {
+      timeout: 60000,
+    },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
+
+export { loadEnv, getSupabaseCredentials, getSupabaseServiceRoleKey, getSupabaseClient };
