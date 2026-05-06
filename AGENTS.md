@@ -107,6 +107,7 @@ bash scripts/start.sh
 **API 接口：**
 - `POST /api/trades` - 添加交易（买入/卖出）
 - `GET /api/trades` - 获取交易历史（支持 symbol, startDate, endDate, limit 参数）
+- `PUT /api/trades/:id` - 编辑交易记录
 - `GET /api/positions` - 获取当前持仓（基于交易记录计算）
 - `GET /api/pnl` - 获取盈亏统计（支持时间范围和股票筛选）
 - `DELETE /api/trades/:id` - 删除交易记录
@@ -127,6 +128,6 @@ bash scripts/start.sh
 - 支持按交易类型筛选（买入/卖出）
 - 支持按日期范围筛选
 - 分页显示（每页10条）
-- 可删除单条交易记录
+- 可编辑和删除单条交易记录
 
 **注意：** Session（登录状态）仍存储在内存中，服务重启后需重新登录。

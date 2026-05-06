@@ -286,6 +286,62 @@ export async function getProfitLoss(
 }
 
 // 删除交易记录（用于修正错误）
+// 更新交易记录
+export async function updateTrade(
+  userId: string, 
+  tradeId: string, 
+  updates: Partial<Omit<TradeInput, 'symbol' | 'name' | 'type'>>
+): Promise<Trade> {
+  const client = getSupabaseClient();
+  
+  const updateData: Record<string, string> = {};
+  
+  if (updates.shares !== undefined) {
+    updateData.shares = updates.shares.toString();
+  }
+  if (updates.price !== undefined) {
+    updateData.price = updates.price.toString();
+  }
+  if (updates.commission !== undefined) {
+    updateData.commission = updates.commission.toString();
+  }
+  if (updates.trade_date !== undefined) {
+    updateData.trade_date = updates.trade_date;
+  }
+  
+  // 如果 shares 或 price 更新了，需要重新计算 total_amount
+  // 先获取原记录
+  const { data: oldTrade, error: fetchError } = await client
+    .from('trades')
+    .select('*')
+    .eq('id', tradeId)
+    .eq('user_id', userId)
+    .single();
+  
+  if (fetchError || !oldTrade) {
+    throw new Error(`未找到交易记录: ${fetchError?.message || '记录不存在'}`);
+  }
+  
+  const newShares = updates.shares !== undefined ? updates.shares : parseFloat((oldTrade as Trade).shares.toString());
+  const newPrice = updates.price !== undefined ? updates.price : parseFloat((oldTrade as Trade).price.toString());
+  updateData.total_amount = (newShares * newPrice).toString();
+  
+  const { data, error } = await client
+    .from('trades')
+    .update(updateData)
+    .eq('id', tradeId)
+    .eq('user_id', userId)
+    .select()
+    .single();
+  
+  if (error) {
+    throw new Error(`更新交易记录失败: ${error.message}`);
+  }
+  
+  console.log(`Trade updated: ${tradeId}`);
+  return data as Trade;
+}
+
 export async function deleteTrade(userId: string, tradeId: string): Promise<void> {
   const client = getSupabaseClient();
   

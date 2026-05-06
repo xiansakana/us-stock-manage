@@ -6,7 +6,7 @@ import { createServer, type Server } from 'http';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import { setupVite } from './vite';
-import { getPortfolio, savePortfolio, getPositions, addTrade, getTrades, getProfitLoss, deleteTrade, getPositionDetail, type TradeInput } from './storage/database/portfolioStore';
+import { getPortfolio, savePortfolio, getPositions, addTrade, getTrades, getProfitLoss, deleteTrade, updateTrade, getPositionDetail, type TradeInput } from './storage/database/portfolioStore';
 
 const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
@@ -209,6 +209,47 @@ async function startServer(): Promise<Server> {
     } catch (error) {
       console.error('添加交易失败:', error);
       res.status(500).json({ error: '添加交易失败' });
+    }
+  });
+
+  // 编辑交易记录
+  app.put('/api/trades/:id', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '未登录' });
+    }
+    
+    const token = authHeader.slice(7);
+    const session = sessions.get(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Token 无效或已过期' });
+    }
+    
+    const { id } = req.params;
+    const updates = req.body as {
+      shares?: number;
+      price?: number;
+      commission?: number;
+      trade_date?: string;
+    };
+    
+    // 验证
+    if (updates.shares !== undefined && updates.shares <= 0) {
+      return res.status(400).json({ error: '股数必须大于 0' });
+    }
+    if (updates.price !== undefined && updates.price <= 0) {
+      return res.status(400).json({ error: '价格必须大于 0' });
+    }
+    if (updates.commission !== undefined && updates.commission < 0) {
+      return res.status(400).json({ error: '手续费不能为负数' });
+    }
+    
+    try {
+      const trade = await updateTrade(token, id, updates);
+      res.json({ success: true, trade });
+    } catch (error) {
+      console.error('编辑交易失败:', error);
+      res.status(500).json({ error: (error as Error).message || '编辑交易失败' });
     }
   });
 
