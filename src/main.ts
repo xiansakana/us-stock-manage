@@ -131,6 +131,10 @@ let tradeHistoryFilter = {
 let tradeHistoryPage = 1;
 const tradeHistoryPageSize = 10;
 
+/** 编辑交易弹窗状态 */
+let editTradeModalOpen = false;
+let editingTrade: TradeRecord | null = null;
+
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
 let tableSortKey: TableSortKey = 'weight';
@@ -752,6 +756,58 @@ function closeTradeForm(): void {
   render();
 }
 
+// 打开编辑交易弹窗
+function openEditTradeModal(trade: TradeRecord): void {
+  editingTrade = trade;
+  editTradeModalOpen = true;
+  render();
+}
+
+// 关闭编辑交易弹窗
+function closeEditTradeModal(): void {
+  editTradeModalOpen = false;
+  editingTrade = null;
+  render();
+}
+
+// 提交编辑交易
+async function submitEditTrade(): Promise<void> {
+  if (!editingTrade) return;
+  
+  const sharesEl = document.getElementById('edit-trade-shares') as HTMLInputElement | null;
+  const priceEl = document.getElementById('edit-trade-price') as HTMLInputElement | null;
+  const commissionEl = document.getElementById('edit-trade-commission') as HTMLInputElement | null;
+  const dateEl = document.getElementById('edit-trade-date') as HTMLInputElement | null;
+  
+  const shares = parseFloat(sharesEl?.value || '0');
+  const price = parseFloat(priceEl?.value || '0');
+  const commission = parseFloat(commissionEl?.value || '0');
+  const tradeDate = dateEl?.value || '';
+  
+  if (shares <= 0 || price <= 0) {
+    renderError('股数和价格必须大于 0');
+    return;
+  }
+  
+  try {
+    const success = await updateTradeRecord(editingTrade.id, {
+      shares,
+      price,
+      commission,
+      trade_date: tradeDate ? new Date(tradeDate).toISOString() : undefined
+    });
+    
+    if (success) {
+      await loadTradesFiltered();
+      render();
+      renderSuccess('交易记录已更新');
+      closeEditTradeModal();
+    }
+  } catch (e) {
+    renderError((e as Error).message);
+  }
+}
+
 // 提交交易
 async function submitTrade(): Promise<void> {
   const sharesEl = document.getElementById('trade-shares') as HTMLInputElement | null;
@@ -1194,6 +1250,38 @@ async function deleteTradeRecord(tradeId: string): Promise<boolean> {
   } catch (e) {
     console.error('删除交易失败:', e);
     return false;
+  }
+}
+
+// 更新交易记录
+async function updateTradeRecord(
+  tradeId: string, 
+  updates: { shares?: number; price?: number; commission?: number; trade_date?: string }
+): Promise<boolean> {
+  if (!authToken) return false;
+  
+  try {
+    const res = await fetch(`/api/trades/${tradeId}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`
+      },
+      body: JSON.stringify(updates)
+    });
+    if (res.status === 401) {
+      authToken = null;
+      sessionUsername = null;
+      return false;
+    }
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    return true;
+  } catch (e) {
+    console.error('更新交易失败:', e);
+    throw e;
   }
 }
 
@@ -2002,10 +2090,16 @@ function renderTradeHistoryModal(): string {
           ${trade.commission > 0 ? `-$${formatNumber(trade.commission)}` : '-'}
         </td>
         <td style="padding: 12px;">
-          <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol}')" 
-                  style="padding: 4px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.8rem;">
-            删除
-          </button>
+          <div style="display: flex; gap: 6px;">
+            <button onclick="openEditTradeModal(${JSON.stringify(trade).replace(/"/g, '&quot;')})" 
+                    style="padding: 4px 10px; background: #e0e7ff; border: 1px solid #c7d2fe; border-radius: 4px; color: #4f46e5; cursor: pointer; font-size: 0.8rem;">
+              编辑
+            </button>
+            <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol}')" 
+                    style="padding: 4px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.8rem;">
+              删除
+            </button>
+          </div>
         </td>
       </tr>
     `;
@@ -2115,6 +2209,80 @@ function renderTradeHistoryModal(): string {
             </tbody>
           </table>
           ${paginationHtml}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// 渲染编辑交易弹窗
+function renderEditTradeModal(): string {
+  if (!editTradeModalOpen || !editingTrade) return '';
+  
+  const tradeDate = editingTrade.trade_date.split('T')[0];
+  const isBuy = editingTrade.type === 'buy';
+  
+  return `
+    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1100; display: flex; align-items: center; justify-content: center;">
+      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 450px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="margin: 0; color: #334155;">
+            <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 8px;">
+              ${isBuy ? '买入' : '卖出'}
+            </span>
+            编辑 ${editingTrade.symbol}
+          </h3>
+          <button onclick="closeEditTradeModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
+        </div>
+        
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股票名称</label>
+          <input type="text" value="${editingTrade.name}" readonly
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155;" />
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股数 *</label>
+            <input type="number" id="edit-trade-shares" value="${editingTrade.shares}" min="0.01" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">价格 *</label>
+            <input type="number" id="edit-trade-price" value="${editingTrade.price}" min="0.01" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">手续费</label>
+            <input type="number" id="edit-trade-commission" value="${editingTrade.commission}" min="0" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易日期</label>
+            <input type="date" id="edit-trade-date" value="${tradeDate}" max="${new Date().toISOString().split('T')[0]}"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+        
+        <div id="edit-trade-amount-preview" style="padding: 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 16px; text-align: center;">
+          <span style="color: #64748b; font-size: 0.85rem;">金额: </span>
+          <span style="font-weight: 600; color: #334155;" id="edit-trade-amount-value">
+            ${isBuy ? '-' : '+'}$${formatNumber(editingTrade.shares * editingTrade.price)}
+          </span>
+        </div>
+        
+        <div style="display: flex; gap: 10px;">
+          <button onclick="closeEditTradeModal()" 
+                  style="flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-weight: 600; cursor: pointer;">
+            取消
+          </button>
+          <button onclick="submitEditTrade()" 
+                  style="flex: 1; padding: 12px; border: none; border-radius: 6px; background: #667eea; color: white; font-weight: 600; font-size: 1rem; cursor: pointer;">
+            保存修改
+          </button>
         </div>
       </div>
     </div>
@@ -2768,6 +2936,9 @@ function render(): void {
         <!-- 交易历史记录弹窗 -->
         ${renderTradeHistoryModal()}
         
+        <!-- 编辑交易弹窗 -->
+        ${renderEditTradeModal()}
+        
         <!-- 交易表单弹窗 -->
         ${tradePanelOpen ? renderTradeForm() : ''}
       </div>
@@ -2833,6 +3004,9 @@ void init();
 (window as any).setTradeHistoryFilter = setTradeHistoryFilter;
 (window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
 (window as any).setTradeHistoryPage = setTradeHistoryPage;
+(window as any).openEditTradeModal = openEditTradeModal;
+(window as any).closeEditTradeModal = closeEditTradeModal;
+(window as any).submitEditTrade = submitEditTrade;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
