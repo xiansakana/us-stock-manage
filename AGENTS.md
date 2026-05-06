@@ -92,3 +92,22 @@ bash scripts/start.sh
 - 构建产物：`dist/`（前端）+ `dist-server/`（服务端）
 - 生产入口：`node dist-server/server.js`
 - 端口固定为 `5000`
+
+### 数据库持久化
+
+持仓数据使用 Supabase PostgreSQL 存储：
+
+**表结构：**
+- `portfolios` - 用户持仓主表（user_id, cash, created_at, updated_at）
+- `portfolio_stocks` - 用户持仓股票表（portfolio_id, symbol, name, shares, avg_cost）
+
+**客户端：**
+- `server/storage/database/supabase-client.ts` - Supabase 客户端（使用 service_role_key 绕过 RLS）
+- `server/storage/database/portfolioStore.ts` - 持仓 CRUD 操作
+
+**数据访问：**
+- `getPortfolio(userId)` - 获取用户持仓
+- `savePortfolio(userId, data)` - 保存用户持仓
+- `deletePortfolio(userId)` - 删除用户持仓
+
+**注意：** Session（登录状态）仍存储在内存中，服务重启后需重新登录。

@@ -6,7 +6,7 @@ import { createServer, type Server } from 'http';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import { setupVite } from './vite';
-import { getPortfolio, savePortfolio } from './storage/portfolioStore';
+import { getPortfolio, savePortfolio } from './storage/database/portfolioStore';
 
 const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
