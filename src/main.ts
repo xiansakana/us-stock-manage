@@ -120,6 +120,17 @@ let tradeFormSymbol = '';
 let tradeFormName = '';
 let tradeFormType: 'buy' | 'sell' = 'buy';
 
+/** 交易记录弹窗状态 */
+let tradeHistoryModalOpen = false;
+let tradeHistoryFilter = {
+  symbol: '',
+  type: '' as '' | 'buy' | 'sell',
+  startDate: '',
+  endDate: ''
+};
+let tradeHistoryPage = 1;
+const tradeHistoryPageSize = 10;
+
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
 let tableSortKey: TableSortKey = 'weight';
@@ -1832,7 +1843,7 @@ function renderTradePanel(): string {
     <!-- 交易操作区域 -->
     <div style="margin-bottom: 20px;">
       <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
-        <button class="btn btn-secondary" onclick="toggleTradeHistory()" style="padding: 8px 16px; font-size: 0.85rem;">
+        <button class="btn btn-secondary" onclick="openTradeHistoryModal()" style="padding: 8px 16px; font-size: 0.85rem;">
           📋 交易记录 (${state.trades.length})
         </button>
         ${state.pnlStats ? `
@@ -1892,43 +1903,107 @@ function renderTradePanel(): string {
   `;
 }
 
-// 渲染交易历史记录
-function renderTradeHistory(): string {
-  if (state.trades.length === 0) {
-    return `
-      <div style="padding: 40px; text-align: center; color: #94a3b8;">
-        <p>暂无交易记录</p>
-        <p style="font-size: 0.85rem;">在下方操作列点击「买入」或「卖出」记录交易</p>
-      </div>
-    `;
+// 打开交易记录弹窗
+function openTradeHistoryModal(): void {
+  tradeHistoryModalOpen = true;
+  tradeHistoryPage = 1;
+  loadTradesFiltered();
+  render();
+}
+
+// 关闭交易记录弹窗
+function closeTradeHistoryModal(): void {
+  tradeHistoryModalOpen = false;
+  render();
+}
+
+// 加载筛选后的交易记录
+async function loadTradesFiltered(): Promise<void> {
+  const trades = await loadTrades({
+    symbol: tradeHistoryFilter.symbol || undefined,
+    startDate: tradeHistoryFilter.startDate || undefined,
+    endDate: tradeHistoryFilter.endDate || undefined,
+    limit: '1000' // 加载更多用于分页
+  });
+  state.trades = trades;
+  render();
+}
+
+// 设置筛选条件
+function setTradeHistoryFilter(field: 'symbol' | 'type' | 'startDate' | 'endDate', value: string): void {
+  if (field === 'type') {
+    tradeHistoryFilter.type = value as '' | 'buy' | 'sell';
+  } else {
+    (tradeHistoryFilter as Record<string, string>)[field] = value;
+  }
+  tradeHistoryPage = 1;
+  void loadTradesFiltered();
+}
+
+// 重置筛选
+function resetTradeHistoryFilter(): void {
+  tradeHistoryFilter = { symbol: '', type: '', startDate: '', endDate: '' };
+  tradeHistoryPage = 1;
+  void loadTradesFiltered();
+}
+
+// 切换分页
+function setTradeHistoryPage(page: number): void {
+  tradeHistoryPage = page;
+  render();
+}
+
+// 渲染交易历史弹窗
+function renderTradeHistoryModal(): string {
+  if (!tradeHistoryModalOpen) return '';
+  
+  // 筛选交易记录
+  let filtered = [...state.trades];
+  if (tradeHistoryFilter.symbol) {
+    filtered = filtered.filter(t => t.symbol.toUpperCase().includes(tradeHistoryFilter.symbol.toUpperCase()));
+  }
+  if (tradeHistoryFilter.type) {
+    filtered = filtered.filter(t => t.type === tradeHistoryFilter.type);
   }
   
-  const rows = state.trades.map(trade => {
+  // 分页计算
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / tradeHistoryPageSize));
+  const startIdx = (tradeHistoryPage - 1) * tradeHistoryPageSize;
+  const pageItems = filtered.slice(startIdx, startIdx + tradeHistoryPageSize);
+  
+  const rows = pageItems.length === 0 ? `
+    <tr>
+      <td colspan="9" style="padding: 40px; text-align: center; color: #94a3b8;">
+        暂无符合条件的交易记录
+      </td>
+    </tr>
+  ` : pageItems.map(trade => {
     const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
     const time = new Date(trade.trade_date).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
     const isBuy = trade.type === 'buy';
     
     return `
       <tr style="border-bottom: 1px solid #e2e8f0;">
-        <td style="padding: 10px; color: #64748b; font-size: 0.85rem;">${date}<br/><span style="font-size: 0.75rem;">${time}</span></td>
-        <td style="padding: 10px;">
-          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600;">
+        <td style="padding: 12px; color: #64748b; font-size: 0.85rem;">${date}<br/><span style="font-size: 0.75rem;">${time}</span></td>
+        <td style="padding: 12px;">
+          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 10px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">
             ${isBuy ? '买入' : '卖出'}
           </span>
         </td>
-        <td style="padding: 10px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
-        <td style="padding: 10px; color: #334155;">${trade.name}</td>
-        <td style="padding: 10px; text-align: right; font-weight: 600;">${formatNumber(trade.shares)} 股</td>
-        <td style="padding: 10px; text-align: right;">@ $${formatNumber(trade.price)}</td>
-        <td style="padding: 10px; text-align: right; font-weight: 600; color: ${isBuy ? '#334155' : '#10b981'};">
+        <td style="padding: 12px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
+        <td style="padding: 12px; color: #334155; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${trade.name}</td>
+        <td style="padding: 12px; text-align: right; font-weight: 600;">${formatNumber(trade.shares)} 股</td>
+        <td style="padding: 12px; text-align: right;">@ $${formatNumber(trade.price)}</td>
+        <td style="padding: 12px; text-align: right; font-weight: 600; color: ${isBuy ? '#334155' : '#10b981'};">
           ${isBuy ? '-' : '+'}$${formatNumber(trade.total_amount)}
         </td>
-        <td style="padding: 10px; text-align: right; color: #64748b; font-size: 0.85rem;">
-          ${trade.commission > 0 ? `手续费: $${formatNumber(trade.commission)}` : '-'}
+        <td style="padding: 12px; text-align: right; color: #ef4444; font-size: 0.85rem;">
+          ${trade.commission > 0 ? `-$${formatNumber(trade.commission)}` : '-'}
         </td>
-        <td style="padding: 10px;">
+        <td style="padding: 12px;">
           <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol}')" 
-                  style="padding: 4px 8px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.75rem;">
+                  style="padding: 4px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.8rem;">
             删除
           </button>
         </td>
@@ -1936,36 +2011,114 @@ function renderTradeHistory(): string {
     `;
   }).join('');
   
-  return `
-    <div style="margin-top: 20px; padding: 20px; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">
-      <h3 style="margin: 0 0 16px 0; color: #334155;">交易历史记录</h3>
-      <table style="width: 100%; border-collapse: collapse;">
-        <thead>
-          <tr style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
-            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">时间</th>
-            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">类型</th>
-            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">代码</th>
-            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">名称</th>
-            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">股数</th>
-            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">价格</th>
-            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">金额</th>
-            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">手续费</th>
-            <th style="padding: 10px; text-align: center; font-size: 0.8rem; color: #64748b;">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
+  // 分页导航
+  const pageNumbers = [];
+  const maxPageButtons = 5;
+  let startPage = Math.max(1, tradeHistoryPage - Math.floor(maxPageButtons / 2));
+  let endPage = Math.min(totalPages, startPage + maxPageButtons - 1);
+  if (endPage - startPage < maxPageButtons - 1) {
+    startPage = Math.max(1, endPage - maxPageButtons + 1);
+  }
+  
+  for (let i = startPage; i <= endPage; i++) {
+    pageNumbers.push(i);
+  }
+  
+  const paginationHtml = totalPages > 1 ? `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
+      <span style="color: #64748b; font-size: 0.85rem;">共 ${total} 条记录</span>
+      <div style="display: flex; gap: 4px; align-items: center;">
+        <button onclick="setTradeHistoryPage(${tradeHistoryPage - 1})" ${tradeHistoryPage === 1 ? 'disabled' : ''}
+                style="padding: 6px 12px; border: 1px solid #e2e8f0; background: white; border-radius: 4px; cursor: ${tradeHistoryPage === 1 ? 'not-allowed' : 'pointer'}; color: ${tradeHistoryPage === 1 ? '#cbd5e1' : '#334155'};">
+          上一页
+        </button>
+        ${pageNumbers.map(p => `
+          <button onclick="setTradeHistoryPage(${p})" 
+                  style="padding: 6px 12px; border: 1px solid ${p === tradeHistoryPage ? '#667eea' : '#e2e8f0'}; background: ${p === tradeHistoryPage ? '#667eea' : 'white'}; color: ${p === tradeHistoryPage ? 'white' : '#334155'}; border-radius: 4px; cursor: pointer; font-weight: ${p === tradeHistoryPage ? '600' : '400'};">
+            ${p}
+          </button>
+        `).join('')}
+        <button onclick="setTradeHistoryPage(${tradeHistoryPage + 1})" ${tradeHistoryPage === totalPages ? 'disabled' : ''}
+                style="padding: 6px 12px; border: 1px solid #e2e8f0; background: white; border-radius: 4px; cursor: ${tradeHistoryPage === totalPages ? 'not-allowed' : 'pointer'}; color: ${tradeHistoryPage === totalPages ? '#cbd5e1' : '#334155'};">
+          下一页
+        </button>
+      </div>
+    </div>
+  ` : `
+    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; color: #64748b; font-size: 0.85rem;">
+      共 ${total} 条记录
     </div>
   `;
-}
-
-// 切换交易历史显示
-let tradeHistoryVisible = false;
-function toggleTradeHistory(): void {
-  tradeHistoryVisible = !tradeHistoryVisible;
-  render();
+  
+  return `
+    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <div style="background: white; border-radius: 12px; width: 100%; max-width: 1000px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+        <!-- 头部 -->
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
+          <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">交易记录</h2>
+          <button onclick="closeTradeHistoryModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8; padding: 4px;">&times;</button>
+        </div>
+        
+        <!-- 筛选区域 -->
+        <div style="padding: 16px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc;">
+          <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
+            <div>
+              <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">股票代码</label>
+              <input type="text" value="${tradeHistoryFilter.symbol}" oninput="setTradeHistoryFilter('symbol', this.value)" placeholder="如：AAPL"
+                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; width: 120px;" />
+            </div>
+            <div>
+              <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">交易类型</label>
+              <select onchange="setTradeHistoryFilter('type', this.value)"
+                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; min-width: 100px;">
+                <option value="" ${!tradeHistoryFilter.type ? 'selected' : ''}>全部</option>
+                <option value="buy" ${tradeHistoryFilter.type === 'buy' ? 'selected' : ''}>买入</option>
+                <option value="sell" ${tradeHistoryFilter.type === 'sell' ? 'selected' : ''}>卖出</option>
+              </select>
+            </div>
+            <div>
+              <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">开始日期</label>
+              <input type="date" value="${tradeHistoryFilter.startDate}" onchange="setTradeHistoryFilter('startDate', this.value)"
+                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem;" />
+            </div>
+            <div>
+              <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">结束日期</label>
+              <input type="date" value="${tradeHistoryFilter.endDate}" onchange="setTradeHistoryFilter('endDate', this.value)"
+                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem;" />
+            </div>
+            <div>
+              <button onclick="resetTradeHistoryFilter()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; cursor: pointer; font-size: 0.85rem;">
+                重置
+              </button>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 表格区域 -->
+        <div style="flex: 1; overflow-y: auto; padding: 0 24px;">
+          <table style="width: 100%; border-collapse: collapse; min-width: 800px;">
+            <thead style="position: sticky; top: 0; background: white; z-index: 1;">
+              <tr style="border-bottom: 2px solid #e2e8f0;">
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">时间</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">类型</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">代码</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">名称</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">股数</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">价格</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">金额</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">手续费</th>
+                <th style="padding: 12px; text-align: center; font-size: 0.8rem; color: #64748b; font-weight: 600;">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+          ${paginationHtml}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 // 渲染交易表单
@@ -2612,8 +2765,8 @@ function render(): void {
           </div>
         `}
         
-        <!-- 交易历史记录 -->
-        ${tradeHistoryVisible ? renderTradeHistory() : ''}
+        <!-- 交易历史记录弹窗 -->
+        ${renderTradeHistoryModal()}
         
         <!-- 交易表单弹窗 -->
         ${tradePanelOpen ? renderTradeForm() : ''}
@@ -2675,7 +2828,11 @@ void init();
 (window as any).submitTrade = submitTrade;
 (window as any).handleDeleteTrade = handleDeleteTrade;
 (window as any).refreshPnlStats = refreshPnlStats;
-(window as any).toggleTradeHistory = toggleTradeHistory;
+(window as any).openTradeHistoryModal = openTradeHistoryModal;
+(window as any).closeTradeHistoryModal = closeTradeHistoryModal;
+(window as any).setTradeHistoryFilter = setTradeHistoryFilter;
+(window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
+(window as any).setTradeHistoryPage = setTradeHistoryPage;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
