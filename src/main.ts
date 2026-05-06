@@ -135,6 +135,11 @@ const tradeHistoryPageSize = 10;
 let editTradeModalOpen = false;
 let editingTrade: TradeRecord | null = null;
 
+/** 导入交易弹窗状态 */
+let importTradeModalOpen = false;
+let importPreviewData: TradeRecord[] = [];
+let importError: string | null = null;
+
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
 let tableSortKey: TableSortKey = 'weight';
@@ -1169,14 +1174,14 @@ async function loadPortfolioOnStartup(): Promise<void> {
 // ========== 交易相关 API ==========
 
 // 加载交易记录
-async function loadTrades(options?: { symbol?: string; startDate?: string; endDate?: string }): Promise<TradeRecord[]> {
+async function loadTrades(options?: { symbol?: string; startDate?: string; endDate?: string; limit?: string }): Promise<TradeRecord[]> {
   if (!authToken) return [];
   
   const params = new URLSearchParams();
   if (options?.symbol) params.append('symbol', options.symbol);
   if (options?.startDate) params.append('startDate', options.startDate);
   if (options?.endDate) params.append('endDate', options.endDate);
-  if (options?.symbol) params.append('limit', '100');
+  if (options?.limit) params.append('limit', options.limit);
   
   try {
     const res = await fetch(`/api/trades?${params.toString()}`, {
@@ -1285,6 +1290,271 @@ async function updateTradeRecord(
   }
 }
 
+// 导出交易记录为 CSV
+function exportTradesToCSV(): void {
+  if (state.trades.length === 0) {
+    renderError('没有交易记录可导出');
+    return;
+  }
+  
+  const headers = ['时间', '类型', '代码', '名称', '股数', '价格', '金额', '手续费'];
+  const rows = state.trades.map(trade => [
+    new Date(trade.trade_date).toLocaleString('zh-CN'),
+    trade.type === 'buy' ? '买入' : '卖出',
+    trade.symbol,
+    trade.name,
+    trade.shares.toString(),
+    trade.price.toString(),
+    trade.total_amount.toString(),
+    trade.commission.toString()
+  ]);
+  
+  const csvContent = [headers, ...rows]
+    .map(row => row.map(cell => `"${cell}"`).join(','))
+    .join('\n');
+  
+  const BOM = '\uFEFF'; // UTF-8 BOM
+  const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `交易记录_${new Date().toISOString().split('T')[0]}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+  
+  renderSuccess('交易记录已导出');
+}
+
+// 导出交易记录为 JSON
+function exportTradesToJSON(): void {
+  if (state.trades.length === 0) {
+    renderError('没有交易记录可导出');
+    return;
+  }
+  
+  const exportData = state.trades.map(trade => ({
+    symbol: trade.symbol,
+    name: trade.name,
+    type: trade.type === 'buy' ? '买入' : '卖出',
+    shares: trade.shares,
+    price: trade.price,
+    commission: trade.commission,
+    trade_date: trade.trade_date
+  }));
+  
+  const jsonContent = JSON.stringify(exportData, null, 2);
+  const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `交易记录_${new Date().toISOString().split('T')[0]}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  
+  renderSuccess('交易记录已导出');
+}
+
+// 打开导入弹窗
+function openImportTradeModal(): void {
+  importTradeModalOpen = true;
+  importPreviewData = [];
+  importError = null;
+  render();
+}
+
+// 关闭导入弹窗
+function closeImportTradeModal(): void {
+  importTradeModalOpen = false;
+  importPreviewData = [];
+  importError = null;
+  render();
+}
+
+// 处理文件导入
+function handleFileImport(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const content = e.target?.result as string;
+    try {
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      
+      if (ext === 'csv') {
+        importPreviewData = parseCSV(content);
+      } else if (ext === 'json') {
+        importPreviewData = parseJSON(content);
+      } else {
+        importError = '不支持的文件格式，请上传 CSV 或 JSON 文件';
+        render();
+        return;
+      }
+      
+      if (importPreviewData.length === 0) {
+        importError = '文件中没有有效的交易记录';
+      } else {
+        importError = null;
+      }
+      render();
+    } catch (err) {
+      importError = `解析文件失败: ${(err as Error).message}`;
+      importPreviewData = [];
+      render();
+    }
+  };
+  reader.readAsText(file);
+}
+
+// 解析 CSV
+function parseCSV(content: string): TradeRecord[] {
+  const lines = content.split('\n').filter(line => line.trim());
+  if (lines.length < 2) return [];
+  
+  const trades: TradeRecord[] = [];
+  
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseCSVLine(lines[i]);
+    if (cells.length >= 5) {
+      const trade = {
+        id: `import-${i}-${Date.now()}`,
+        symbol: cells[2]?.trim() || cells[1]?.trim() || '',
+        name: cells[3]?.trim() || '',
+        type: (cells[1]?.trim() === '买入' || cells[1]?.toLowerCase() === 'buy') ? 'buy' as const : 'sell' as const,
+        shares: parseFloat(cells[4]?.trim() || '0'),
+        price: parseFloat(cells[5]?.trim() || '0'),
+        total_amount: parseFloat(cells[6]?.trim() || '0'),
+        commission: parseFloat(cells[7]?.trim() || '0'),
+        trade_date: parseCSVDate(cells[0]),
+        created_at: new Date().toISOString()
+      };
+      
+      if (trade.symbol && trade.shares > 0 && trade.price > 0) {
+        if (trade.total_amount === 0) {
+          trade.total_amount = trade.shares * trade.price;
+        }
+        trades.push(trade);
+      }
+    }
+  }
+  
+  return trades;
+}
+
+// 解析 CSV 行
+function parseCSVLine(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+// 解析 CSV 日期
+function parseCSVDate(dateStr: string): string {
+  const str = dateStr?.trim().replace(/"/g, '');
+  if (!str) return new Date().toISOString();
+  
+  // 尝试解析常见格式
+  const date = new Date(str);
+  if (!isNaN(date.getTime())) {
+    return date.toISOString();
+  }
+  
+  // 尝试中文格式
+  const cnMatch = str.match(/(\d{4})[年/](\d{1,2})[月/](\d{1,2})/);
+  if (cnMatch) {
+    return new Date(parseInt(cnMatch[1]), parseInt(cnMatch[2]) - 1, parseInt(cnMatch[3])).toISOString();
+  }
+  
+  return new Date().toISOString();
+}
+
+// 解析 JSON
+function parseJSON(content: string): TradeRecord[] {
+  const data = JSON.parse(content);
+  const arr = Array.isArray(data) ? data : data.trades || [];
+  
+  return arr.map((item: Record<string, unknown>, index: number) => {
+    const type = (item.type as string);
+    const shares = parseFloat(String(item.shares || 0));
+    const price = parseFloat(String(item.price || 0));
+    
+    return {
+      id: `import-${index}-${Date.now()}`,
+      symbol: String(item.symbol || item.code || '').toUpperCase(),
+      name: String(item.name || item.stockName || ''),
+      type: (type === '买入' || type === 'buy' || type === 'BUY') ? 'buy' as const : 'sell' as const,
+      shares,
+      price,
+      total_amount: parseFloat(String(item.total_amount || item.amount || shares * price)),
+      commission: parseFloat(String(item.commission || item.fee || 0)),
+      trade_date: item.trade_date ? new Date(item.trade_date as string).toISOString() : new Date().toISOString(),
+      created_at: new Date().toISOString()
+    };
+  }).filter((t: TradeRecord) => t.symbol && t.shares > 0 && t.price > 0);
+}
+
+// 确认导入
+async function confirmImportTrades(): Promise<void> {
+  if (importPreviewData.length === 0) {
+    renderError('没有可导入的交易记录');
+    return;
+  }
+  
+  let successCount = 0;
+  let failCount = 0;
+  
+  for (const trade of importPreviewData) {
+    try {
+      const success = await addTradeRecord({
+        symbol: trade.symbol,
+        name: trade.name,
+        type: trade.type,
+        shares: trade.shares,
+        price: trade.price,
+        commission: trade.commission,
+        trade_date: trade.trade_date
+      });
+      if (success) successCount++;
+      else failCount++;
+    } catch {
+      failCount++;
+    }
+  }
+  
+  // 重新加载数据
+  await loadTradesFiltered();
+  await loadPnlStatsOnStartup();
+  
+  closeImportTradeModal();
+  render();
+  
+  if (failCount === 0) {
+    renderSuccess(`成功导入 ${successCount} 笔交易记录`);
+  } else {
+    renderError(`导入完成：成功 ${successCount} 笔，失败 ${failCount} 笔`);
+  }
+}
+
 // 加载盈亏统计
 async function loadPnlStats(options?: { startDate?: string; endDate?: string; symbol?: string }): Promise<PnlStats | null> {
   if (!authToken) return null;
@@ -1307,6 +1577,12 @@ async function loadPnlStats(options?: { startDate?: string; endDate?: string; sy
     console.error('加载盈亏统计失败:', e);
     return null;
   }
+}
+
+// 加载盈亏统计（用于刷新）
+async function loadPnlStatsOnStartup(): Promise<void> {
+  const pnl = await loadPnlStats();
+  state.pnlStats = pnl;
 }
 
 // 启动时加载交易数据
@@ -2013,6 +2289,7 @@ async function loadTradesFiltered(): Promise<void> {
     endDate: tradeHistoryFilter.endDate || undefined,
     limit: '1000' // 加载更多用于分页
   });
+  // 直接替换，而不是追加
   state.trades = trades;
   render();
 }
@@ -2150,6 +2427,19 @@ function renderTradeHistoryModal(): string {
         <!-- 头部 -->
         <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
           <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">交易记录</h2>
+          <div style="display: flex; gap: 8px;">
+            <button onclick="openImportTradeModal()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
+              导入
+            </button>
+            <div style="position: relative; display: inline-block;">
+              <button onclick="exportTradesToCSV()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
+                导出 CSV
+              </button>
+            </div>
+            <button onclick="exportTradesToJSON()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
+              导出 JSON
+            </button>
+          </div>
           <button onclick="closeTradeHistoryModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8; padding: 4px;">&times;</button>
         </div>
         
@@ -2209,6 +2499,97 @@ function renderTradeHistoryModal(): string {
             </tbody>
           </table>
           ${paginationHtml}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// 渲染导入交易弹窗
+function renderImportTradeModal(): string {
+  if (!importTradeModalOpen) return '';
+  
+  const previewRows = importPreviewData.length > 0 ? importPreviewData.slice(0, 5).map(trade => {
+    const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
+    const isBuy = trade.type === 'buy';
+    return `
+      <tr style="border-bottom: 1px solid #e2e8f0;">
+        <td style="padding: 8px; font-size: 0.85rem; color: #64748b;">${date}</td>
+        <td style="padding: 8px;">
+          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75rem;">
+            ${isBuy ? '买入' : '卖出'}
+          </span>
+        </td>
+        <td style="padding: 8px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
+        <td style="padding: 8px; font-size: 0.85rem;">${trade.name}</td>
+        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">${formatNumber(trade.shares)}</td>
+        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">$${formatNumber(trade.price)}</td>
+      </tr>
+    `;
+  }).join('') : '';
+  
+  return `
+    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1200; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <div style="background: white; border-radius: 12px; width: 100%; max-width: 600px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+        <!-- 头部 -->
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
+          <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">导入交易记录</h2>
+          <button onclick="closeImportTradeModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8; padding: 4px;">&times;</button>
+        </div>
+        
+        <!-- 内容 -->
+        <div style="padding: 24px; overflow-y: auto;">
+          <!-- 文件选择 -->
+          <div style="margin-bottom: 20px;">
+            <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 500;">选择文件</label>
+            <input type="file" accept=".csv,.json" onchange="handleFileImport(event)"
+                   style="width: 100%; padding: 12px; border: 2px dashed #cbd5e1; border-radius: 8px; background: #f8fafc;" />
+            <p style="margin-top: 8px; color: #64748b; font-size: 0.85rem;">
+              支持 CSV 和 JSON 格式。CSV 格式需包含：时间、类型、代码、名称、数量、价格、手续费（可选）列。
+            </p>
+          </div>
+          
+          <!-- 错误提示 -->
+          ${importError ? `
+            <div style="padding: 12px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; color: #ef4444; margin-bottom: 16px;">
+              ${importError}
+            </div>
+          ` : ''}
+          
+          <!-- 预览 -->
+          ${importPreviewData.length > 0 ? `
+            <div style="margin-top: 16px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="color: #334155; font-weight: 500;">预览（前 5 条，共 ${importPreviewData.length} 条）</span>
+              </div>
+              <table style="width: 100%; border-collapse: collapse; border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden;">
+                <thead>
+                  <tr style="background: #f8fafc;">
+                    <th style="padding: 8px; text-align: left; font-size: 0.8rem; color: #64748b;">时间</th>
+                    <th style="padding: 8px; text-align: left; font-size: 0.8rem; color: #64748b;">类型</th>
+                    <th style="padding: 8px; text-align: left; font-size: 0.8rem; color: #64748b;">代码</th>
+                    <th style="padding: 8px; text-align: left; font-size: 0.8rem; color: #64748b;">名称</th>
+                    <th style="padding: 8px; text-align: right; font-size: 0.8rem; color: #64748b;">数量</th>
+                    <th style="padding: 8px; text-align: right; font-size: 0.8rem; color: #64748b;">价格</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${previewRows}
+                </tbody>
+              </table>
+              ${importPreviewData.length > 5 ? `<p style="margin-top: 8px; color: #64748b; font-size: 0.85rem;">... 还有 ${importPreviewData.length - 5} 条记录</p>` : ''}
+            </div>
+          ` : ''}
+        </div>
+        
+        <!-- 底部按钮 -->
+        <div style="display: flex; gap: 12px; padding: 16px 24px; border-top: 1px solid #e2e8f0;">
+          <button onclick="closeImportTradeModal()" style="flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-weight: 500; cursor: pointer;">
+            取消
+          </button>
+          <button onclick="confirmImportTrades()" ${importPreviewData.length === 0 ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : 'style="flex: 1; padding: 12px; border: none; border-radius: 6px; background: #10b981; color: white; font-weight: 600; cursor: pointer;"'} >
+            导入 ${importPreviewData.length > 0 ? `(${importPreviewData.length} 条)` : ''}
+          </button>
         </div>
       </div>
     </div>
@@ -2936,6 +3317,9 @@ function render(): void {
         <!-- 交易历史记录弹窗 -->
         ${renderTradeHistoryModal()}
         
+        <!-- 导入交易弹窗 -->
+        ${renderImportTradeModal()}
+        
         <!-- 编辑交易弹窗 -->
         ${renderEditTradeModal()}
         
@@ -3007,6 +3391,12 @@ void init();
 (window as any).openEditTradeModal = openEditTradeModal;
 (window as any).closeEditTradeModal = closeEditTradeModal;
 (window as any).submitEditTrade = submitEditTrade;
+(window as any).exportTradesToCSV = exportTradesToCSV;
+(window as any).exportTradesToJSON = exportTradesToJSON;
+(window as any).openImportTradeModal = openImportTradeModal;
+(window as any).closeImportTradeModal = closeImportTradeModal;
+(window as any).handleFileImport = handleFileImport;
+(window as any).confirmImportTrades = confirmImportTrades;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
