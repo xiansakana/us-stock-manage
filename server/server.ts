@@ -6,6 +6,7 @@ import { createServer, type Server } from 'http';
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import { setupVite } from './vite';
+import { getPortfolio, savePortfolio } from './storage/portfolioStore';
 
 const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
@@ -119,7 +120,7 @@ async function startServer(): Promise<Server> {
   });
 
   // 获取持仓
-  app.get('/api/portfolios', (req, res) => {
+  app.get('/api/portfolios', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ error: '未登录' });
@@ -131,11 +132,17 @@ async function startServer(): Promise<Server> {
       return res.status(401).json({ error: 'Token 无效或已过期' });
     }
     
-    res.json(session?.portfolio || { stocks: [], cash: 0 });
+    try {
+      const portfolio = await getPortfolio(token);
+      res.json(portfolio);
+    } catch (error) {
+      console.error('获取持仓失败:', error);
+      res.status(500).json({ error: '获取持仓失败' });
+    }
   });
 
   // 保存持仓
-  app.put('/api/portfolios', (req, res) => {
+  app.put('/api/portfolios', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ error: '未登录' });
@@ -147,15 +154,17 @@ async function startServer(): Promise<Server> {
       return res.status(401).json({ error: 'Token 无效或已过期' });
     }
     
-    console.log('保存持仓成功');
+    const { stocks = [], cash = 0 } = req.body as { stocks?: unknown[]; cash?: number };
     
-    // 保存持仓数据到会话
-    session.portfolio = {
-      stocks: req.body.stocks || [],
-      cash: req.body.cash || 0
-    };
-    
-    res.json({ success: true });
+    try {
+      await savePortfolio(token, { stocks, cash });
+      // 同时更新内存会话
+      session.portfolio = { stocks, cash };
+      res.json({ success: true });
+    } catch (error) {
+      console.error('保存持仓失败:', error);
+      res.status(500).json({ error: '保存持仓失败' });
+    }
   });
 
   // 股票查询 (Finnhub)
