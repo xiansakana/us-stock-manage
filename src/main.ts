@@ -62,6 +62,36 @@ interface AppState {
   cash: number;
   loading: boolean;
   error: string;
+  /** 交易历史记录 */
+  trades: TradeRecord[];
+  /** 当前用户盈亏统计 */
+  pnlStats: PnlStats | null;
+  /** 盈亏统计时间范围 */
+  pnlStartDate: string;
+  pnlEndDate: string;
+}
+
+// 交易记录类型
+interface TradeRecord {
+  id: string;
+  symbol: string;
+  name: string;
+  type: 'buy' | 'sell';
+  shares: number;
+  price: number;
+  total_amount: number;
+  commission: number;
+  trade_date: string;
+  created_at: string;
+}
+
+// 盈亏统计类型
+interface PnlStats {
+  totalBuyAmount: number;
+  totalSellAmount: number;
+  realizedPL: number;
+  commission: number;
+  netPL: number;
 }
 
 // 应用状态
@@ -73,12 +103,22 @@ const state: AppState = {
   totalPnl: null,
   cash: 0,
   loading: false,
-  error: ''
+  error: '',
+  trades: [],
+  pnlStats: null,
+  pnlStartDate: '',
+  pnlEndDate: ''
 };
 
 /** 当前登录用户名；null 表示未登录，仅展示登录/注册页 */
 let sessionUsername: string | null = null;
 let authPanelTab: 'login' | 'register' = 'login';
+
+/** 交易面板状态 */
+let tradePanelOpen = false;
+let tradeFormSymbol = '';
+let tradeFormName = '';
+let tradeFormType: 'buy' | 'sell' = 'buy';
 
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
@@ -684,6 +724,91 @@ function renderSuccess(message: string): void {
   }
 }
 
+// ========== 交易 UI 函数 ==========
+
+// 打开交易表单
+function openTradeForm(symbol: string, name: string, type: 'buy' | 'sell'): void {
+  tradeFormSymbol = symbol;
+  tradeFormName = name;
+  tradeFormType = type;
+  tradePanelOpen = true;
+  render();
+}
+
+// 关闭交易表单
+function closeTradeForm(): void {
+  tradePanelOpen = false;
+  render();
+}
+
+// 提交交易
+async function submitTrade(): Promise<void> {
+  const sharesEl = document.getElementById('trade-shares') as HTMLInputElement | null;
+  const priceEl = document.getElementById('trade-price') as HTMLInputElement | null;
+  const commissionEl = document.getElementById('trade-commission') as HTMLInputElement | null;
+  const dateEl = document.getElementById('trade-date') as HTMLInputElement | null;
+  
+  const shares = parseFloat(sharesEl?.value || '0');
+  const price = parseFloat(priceEl?.value || '0');
+  const commission = parseFloat(commissionEl?.value || '0');
+  const tradeDate = dateEl?.value || new Date().toISOString().split('T')[0];
+  
+  if (shares <= 0 || price <= 0) {
+    renderError('股数和价格必须大于 0');
+    return;
+  }
+  
+  try {
+    const success = await addTradeRecord({
+      symbol: tradeFormSymbol,
+      name: tradeFormName,
+      type: tradeFormType,
+      shares,
+      price,
+      commission,
+      trade_date: new Date(tradeDate).toISOString()
+    });
+    
+    if (success) {
+      // 重新加载交易数据
+      await loadTradeDataOnStartup();
+      render();
+      renderSuccess(`${tradeFormType === 'buy' ? '买入' : '卖出'}成功：${shares} 股 ${tradeFormSymbol} @ $${price}`);
+      closeTradeForm();
+    }
+  } catch (e) {
+    renderError((e as Error).message);
+  }
+}
+
+// 切换交易类型
+function setTradeType(type: 'buy' | 'sell'): void {
+  tradeFormType = type;
+  render();
+}
+
+// 删除交易记录
+async function handleDeleteTrade(tradeId: string, symbol: string): Promise<void> {
+  if (!confirm(`确定删除这笔 ${symbol} 的交易记录吗？`)) return;
+  
+  const success = await deleteTradeRecord(tradeId);
+  if (success) {
+    await loadTradeDataOnStartup();
+    render();
+    renderSuccess('交易记录已删除');
+  }
+}
+
+// 刷新盈亏统计
+async function refreshPnlStats(): Promise<void> {
+  const pnlStats = await loadPnlStats({
+    startDate: state.pnlStartDate || undefined,
+    endDate: state.pnlEndDate || undefined
+  });
+  state.pnlStats = pnlStats;
+  render();
+}
+
 // 刷新单个股票/期权价格
 async function refreshSingleStock(symbol: string): Promise<void> {
   const stock = state.stocks.find(s => s.symbol === symbol);
@@ -974,6 +1099,130 @@ async function loadPortfolioOnStartup(): Promise<void> {
   }
 }
 
+// ========== 交易相关 API ==========
+
+// 加载交易记录
+async function loadTrades(options?: { symbol?: string; startDate?: string; endDate?: string }): Promise<TradeRecord[]> {
+  if (!authToken) return [];
+  
+  const params = new URLSearchParams();
+  if (options?.symbol) params.append('symbol', options.symbol);
+  if (options?.startDate) params.append('startDate', options.startDate);
+  if (options?.endDate) params.append('endDate', options.endDate);
+  if (options?.symbol) params.append('limit', '100');
+  
+  try {
+    const res = await fetch(`/api/trades?${params.toString()}`, {
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    if (res.status === 401) {
+      return [];
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json() as { trades: TradeRecord[] };
+    return data.trades || [];
+  } catch (e) {
+    console.error('加载交易记录失败:', e);
+    return [];
+  }
+}
+
+// 添加交易记录
+async function addTradeRecord(trade: {
+  symbol: string;
+  name: string;
+  type: 'buy' | 'sell';
+  shares: number;
+  price: number;
+  commission?: number;
+  trade_date?: string;
+}): Promise<boolean> {
+  if (!authToken) return false;
+  
+  try {
+    const res = await fetch('/api/trades', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`
+      },
+      body: JSON.stringify(trade)
+    });
+    if (res.status === 401) {
+      authToken = null;
+      sessionUsername = null;
+      return false;
+    }
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.error || '添加交易失败');
+    }
+    return true;
+  } catch (e) {
+    console.error('添加交易失败:', e);
+    throw e;
+  }
+}
+
+// 删除交易记录
+async function deleteTradeRecord(tradeId: string): Promise<boolean> {
+  if (!authToken) return false;
+  
+  try {
+    const res = await fetch(`/api/trades/${tradeId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    if (res.status === 401) {
+      authToken = null;
+      sessionUsername = null;
+      return false;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return true;
+  } catch (e) {
+    console.error('删除交易失败:', e);
+    return false;
+  }
+}
+
+// 加载盈亏统计
+async function loadPnlStats(options?: { startDate?: string; endDate?: string; symbol?: string }): Promise<PnlStats | null> {
+  if (!authToken) return null;
+  
+  const params = new URLSearchParams();
+  if (options?.startDate) params.append('startDate', options.startDate);
+  if (options?.endDate) params.append('endDate', options.endDate);
+  if (options?.symbol) params.append('symbol', options.symbol);
+  
+  try {
+    const res = await fetch(`/api/pnl?${params.toString()}`, {
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    if (res.status === 401) {
+      return null;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json() as PnlStats;
+  } catch (e) {
+    console.error('加载盈亏统计失败:', e);
+    return null;
+  }
+}
+
+// 启动时加载交易数据
+async function loadTradeDataOnStartup(): Promise<void> {
+  if (!authToken) return;
+  
+  const [trades, pnl] = await Promise.all([
+    loadTrades({ limit: '100' }),
+    loadPnlStats()
+  ]);
+  
+  state.trades = trades;
+  state.pnlStats = pnl;
+}
+
 // 登录
 async function submitLogin(email: string, password: string): Promise<boolean> {
   try {
@@ -990,6 +1239,7 @@ async function submitLogin(email: string, password: string): Promise<boolean> {
     sessionUsername = data.user.email;
     localStorage.setItem('auth_token', authToken!);
     await loadPortfolioOnStartup();
+    await loadTradeDataOnStartup();
     return true;
   } catch (e) {
     console.error('登录失败:', e);
@@ -1012,6 +1262,8 @@ async function submitRegister(email: string, password: string): Promise<boolean>
     authToken = data.token;
     sessionUsername = data.user.email;
     localStorage.setItem('auth_token', authToken!);
+    await loadPortfolioOnStartup();
+    await loadTradeDataOnStartup();
     return true;
   } catch (e) {
     console.error('注册失败:', e);
@@ -1574,6 +1826,218 @@ function getGroupPortfolioPercent(
 }
 
 /** 持仓表格 tbody：按标的分组排序，仅输出明细行（无品类汇总栏） */
+// 渲染交易面板
+function renderTradePanel(): string {
+  return `
+    <!-- 交易操作区域 -->
+    <div style="margin-bottom: 20px;">
+      <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+        <button class="btn btn-secondary" onclick="toggleTradeHistory()" style="padding: 8px 16px; font-size: 0.85rem;">
+          📋 交易记录 (${state.trades.length})
+        </button>
+        ${state.pnlStats ? `
+          <div style="display: flex; gap: 12px; padding: 8px 16px; background: linear-gradient(135deg, #1e293b 0%, #334155 100%); border-radius: 8px; color: white; font-size: 0.85rem;">
+            <span>已实现盈亏: <strong style="color: ${state.pnlStats.realizedPL >= 0 ? '#4ade80' : '#f87171'};">$${formatNumber(state.pnlStats.realizedPL)}</strong></span>
+            <span>手续费: <strong>$${formatNumber(state.pnlStats.commission)}</strong></span>
+            <span>净盈亏: <strong style="color: ${state.pnlStats.netPL >= 0 ? '#4ade80' : '#f87171'};">$${formatNumber(state.pnlStats.netPL)}</strong></span>
+          </div>
+        ` : ''}
+      </div>
+    </div>
+    
+    <!-- 盈亏统计区域 -->
+    <div style="margin-bottom: 20px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;">
+      <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px;">
+        <span style="font-weight: 600; color: #334155;">查询盈亏:</span>
+        <input type="date" id="pnl-start-date" value="${state.pnlStartDate}" onchange="state.pnlStartDate = this.value"
+               style="padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+        <span>至</span>
+        <input type="date" id="pnl-end-date" value="${state.pnlEndDate}" onchange="state.pnlEndDate = this.value"
+               style="padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+        <button class="btn btn-secondary" onclick="refreshPnlStats()" style="padding: 6px 12px; font-size: 0.85rem;">
+          查询
+        </button>
+      </div>
+      ${state.pnlStats ? `
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px;">
+          <div style="padding: 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <div style="font-size: 0.75rem; color: #64748b;">买入总额</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: #334155;">$${formatNumber(state.pnlStats.totalBuyAmount)}</div>
+          </div>
+          <div style="padding: 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <div style="font-size: 0.75rem; color: #64748b;">卖出总额</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: #334155;">$${formatNumber(state.pnlStats.totalSellAmount)}</div>
+          </div>
+          <div style="padding: 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <div style="font-size: 0.75rem; color: #64748b;">已实现盈亏</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: ${state.pnlStats.realizedPL >= 0 ? '#10b981' : '#ef4444'};">
+              ${state.pnlStats.realizedPL >= 0 ? '+' : ''}$${formatNumber(state.pnlStats.realizedPL)}
+            </div>
+          </div>
+          <div style="padding: 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <div style="font-size: 0.75rem; color: #64748b;">手续费</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: #ef4444;">-$${formatNumber(state.pnlStats.commission)}</div>
+          </div>
+          <div style="padding: 12px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 6px; color: white;">
+            <div style="font-size: 0.75rem; opacity: 0.9;">净盈亏</div>
+            <div style="font-size: 1.2rem; font-weight: 700;">
+              ${state.pnlStats.netPL >= 0 ? '+' : ''}$${formatNumber(state.pnlStats.netPL)}
+            </div>
+          </div>
+        </div>
+      ` : `
+        <div style="color: #94a3b8; font-size: 0.85rem;">点击「查询」查看盈亏统计</div>
+      `}
+    </div>
+  `;
+}
+
+// 渲染交易历史记录
+function renderTradeHistory(): string {
+  if (state.trades.length === 0) {
+    return `
+      <div style="padding: 40px; text-align: center; color: #94a3b8;">
+        <p>暂无交易记录</p>
+        <p style="font-size: 0.85rem;">在下方操作列点击「买入」或「卖出」记录交易</p>
+      </div>
+    `;
+  }
+  
+  const rows = state.trades.map(trade => {
+    const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
+    const time = new Date(trade.trade_date).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const isBuy = trade.type === 'buy';
+    
+    return `
+      <tr style="border-bottom: 1px solid #e2e8f0;">
+        <td style="padding: 10px; color: #64748b; font-size: 0.85rem;">${date}<br/><span style="font-size: 0.75rem;">${time}</span></td>
+        <td style="padding: 10px;">
+          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600;">
+            ${isBuy ? '买入' : '卖出'}
+          </span>
+        </td>
+        <td style="padding: 10px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
+        <td style="padding: 10px; color: #334155;">${trade.name}</td>
+        <td style="padding: 10px; text-align: right; font-weight: 600;">${formatNumber(trade.shares)} 股</td>
+        <td style="padding: 10px; text-align: right;">@ $${formatNumber(trade.price)}</td>
+        <td style="padding: 10px; text-align: right; font-weight: 600; color: ${isBuy ? '#334155' : '#10b981'};">
+          ${isBuy ? '-' : '+'}$${formatNumber(trade.total_amount)}
+        </td>
+        <td style="padding: 10px; text-align: right; color: #64748b; font-size: 0.85rem;">
+          ${trade.commission > 0 ? `手续费: $${formatNumber(trade.commission)}` : '-'}
+        </td>
+        <td style="padding: 10px;">
+          <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol}')" 
+                  style="padding: 4px 8px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.75rem;">
+            删除
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+  
+  return `
+    <div style="margin-top: 20px; padding: 20px; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">
+      <h3 style="margin: 0 0 16px 0; color: #334155;">交易历史记录</h3>
+      <table style="width: 100%; border-collapse: collapse;">
+        <thead>
+          <tr style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
+            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">时间</th>
+            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">类型</th>
+            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">代码</th>
+            <th style="padding: 10px; text-align: left; font-size: 0.8rem; color: #64748b;">名称</th>
+            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">股数</th>
+            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">价格</th>
+            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">金额</th>
+            <th style="padding: 10px; text-align: right; font-size: 0.8rem; color: #64748b;">手续费</th>
+            <th style="padding: 10px; text-align: center; font-size: 0.8rem; color: #64748b;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// 切换交易历史显示
+let tradeHistoryVisible = false;
+function toggleTradeHistory(): void {
+  tradeHistoryVisible = !tradeHistoryVisible;
+  render();
+}
+
+// 渲染交易表单
+function renderTradeForm(): string {
+  const today = new Date().toISOString().split('T')[0];
+  const isBuy = tradeFormType === 'buy';
+  
+  return `
+    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="margin: 0; color: #334155;">${isBuy ? '买入' : '卖出'} ${tradeFormSymbol}</h3>
+          <button onclick="closeTradeForm()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
+        </div>
+        
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股票名称</label>
+          <input type="text" value="${tradeFormName}" readonly
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155;" />
+        </div>
+        
+        <div style="display: flex; gap: 10px; margin-bottom: 16px;">
+          <button onclick="setTradeType('buy')" 
+                  style="flex: 1; padding: 10px; border: 2px solid ${isBuy ? '#10b981' : '#e2e8f0'}; border-radius: 6px; background: ${isBuy ? '#ecfdf5' : 'white'}; color: ${isBuy ? '#10b981' : '#64748b'}; font-weight: 600; cursor: pointer;">
+            买入
+          </button>
+          <button onclick="setTradeType('sell')"
+                  style="flex: 1; padding: 10px; border: 2px solid ${!isBuy ? '#ef4444' : '#e2e8f0'}; border-radius: 6px; background: ${!isBuy ? '#fef2f2' : 'white'}; color: ${!isBuy ? '#ef4444' : '#64748b'}; font-weight: 600; cursor: pointer;">
+            卖出
+          </button>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股数 *</label>
+            <input type="number" id="trade-shares" placeholder="0" min="0.01" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">价格 *</label>
+            <input type="number" id="trade-price" placeholder="0.00" min="0.01" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">手续费</label>
+            <input type="number" id="trade-commission" placeholder="0.00" min="0" step="0.01" value="0"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易日期</label>
+            <input type="date" id="trade-date" value="${today}" max="${today}"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+        
+        <div id="trade-amount-preview" style="padding: 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 16px; text-align: center;">
+          <span style="color: #64748b; font-size: 0.85rem;">预计金额: </span>
+          <span style="font-weight: 600; color: #334155;">—</span>
+        </div>
+        
+        <button onclick="submitTrade()" 
+                style="width: 100%; padding: 12px; border: none; border-radius: 6px; background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; font-weight: 600; font-size: 1rem; cursor: pointer;">
+          确认${isBuy ? '买入' : '卖出'}
+        </button>
+      </div>
+    </div>
+  `;
+}
+
 function renderHoldingsTableBody(): string {
   const totalAssets = state.totalValue + state.cash;
   const sorted = [...state.stocks].sort(compareStocksForTable);
@@ -1722,7 +2186,13 @@ function renderHoldingsTableBody(): string {
             columnVisibility.actions
               ? `<td class="holdings-actions-cell ${holdingsCellClass('actions')}">
             <div class="holdings-actions-btns">
-              <button type="button" class="btn btn-secondary holdings-action-btn" title="编辑成本" aria-label="编辑成本" onclick="openCostLotsEditor('${symEsc}')">✎</button>
+              <button type="button" class="btn btn-buy holdings-action-btn" title="记录买入" aria-label="记录买入" 
+                      onclick="openTradeForm('${symEsc}', '${escapeHtml(stock.name).replace(/'/g, "\\'")}', 'buy')"
+                      style="background: #10b981; color: white; border: none;">买</button>
+              <button type="button" class="btn btn-sell holdings-action-btn" title="记录卖出" aria-label="记录卖出"
+                      onclick="openTradeForm('${symEsc}', '${escapeHtml(stock.name).replace(/'/g, "\\'")}', 'sell')"
+                      style="background: #ef4444; color: white; border: none;">卖</button>
+              <button type="button" class="btn btn-secondary holdings-action-btn" title="编辑成本" aria-label="编辑成本" onclick="openCostLotsEditor('${symEsc}')" style="padding: 4px 8px;">✎</button>
               <button type="button" class="btn btn-danger holdings-action-btn" title="移除持仓" aria-label="移除持仓" onclick="removeStock('${symEsc}')">✕</button>
             </div>
           </td>`
@@ -2022,7 +2492,9 @@ function render(): void {
           </label>
         </div>
         
-        ${state.stocks.length === 0 ? `
+        ${renderTradePanel()}
+          
+          ${state.stocks.length === 0 ? `
           <div class="empty-state">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
@@ -2139,6 +2611,12 @@ function render(): void {
             </table>
           </div>
         `}
+        
+        <!-- 交易历史记录 -->
+        ${tradeHistoryVisible ? renderTradeHistory() : ''}
+        
+        <!-- 交易表单弹窗 -->
+        ${tradePanelOpen ? renderTradeForm() : ''}
       </div>
     </div>
   `;
@@ -2155,6 +2633,7 @@ async function init(): Promise<void> {
   await restoreSession();
   if (sessionUsername) {
     await loadPortfolioOnStartup();
+    await loadTradeDataOnStartup();
   }
   render();
   if (sessionUsername) {
@@ -2190,6 +2669,13 @@ void init();
 (window as any).logoutApp = logoutApp;
 (window as any).setHoldingsColumnVisible = setHoldingsColumnVisible;
 (window as any).setDashboardSummaryVisible = setDashboardSummaryVisible;
+(window as any).openTradeForm = openTradeForm;
+(window as any).closeTradeForm = closeTradeForm;
+(window as any).setTradeType = setTradeType;
+(window as any).submitTrade = submitTrade;
+(window as any).handleDeleteTrade = handleDeleteTrade;
+(window as any).refreshPnlStats = refreshPnlStats;
+(window as any).toggleTradeHistory = toggleTradeHistory;
 
 // 下拉搜索相关变量
 let selectedIndex = -1;
