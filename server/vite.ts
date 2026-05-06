@@ -15,18 +15,16 @@ const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
  */
 export async function setupViteMiddleware(app: Application) {
   const vite = await createViteServer({
-    ...viteConfig,
     server: {
-      ...viteConfig.server,
+      port: 5000,
+      host: '0.0.0.0',
       middlewareMode: true,
+      allowedHosts: true,
     },
     appType: 'spa',
   });
 
-  // 使用 Vite middleware 处理所有请求
-  // Vite 会自动跳过 API 路由
   app.use(vite.middlewares);
-
   console.log('🚀 Vite dev server initialized');
 }
 

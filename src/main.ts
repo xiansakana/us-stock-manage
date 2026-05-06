@@ -883,22 +883,27 @@ function buildPortfolioPayload(): {
 let persistDebounceId: ReturnType<typeof setTimeout> | null = null;
 const PERSIST_DEBOUNCE_MS = 400;
 
-/** 防抖写入服务端按用户分文件（需登录 Cookie） */
+let authToken: string | null = null;
+
+/** 防抖写入服务端数据库（需登录） */
 function saveToStorage(): void {
-  if (!sessionUsername) return;
+  if (!authToken) return;
   const data = buildPortfolioPayload();
   if (persistDebounceId !== null) clearTimeout(persistDebounceId);
   persistDebounceId = setTimeout(() => {
     persistDebounceId = null;
     void (async () => {
       try {
-        const res = await fetch('/api/portfolio', {
+        const res = await fetch('/api/portfolios', {
           method: 'PUT',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`
+          },
           body: JSON.stringify(data)
         });
         if (res.status === 401) {
+          authToken = null;
           sessionUsername = null;
           state.stocks = [];
           state.cash = 0;
@@ -933,10 +938,13 @@ function applyPortfolioFromParsed(parsed: { stocks: unknown; cash?: unknown }): 
 }
 
 async function loadPortfolioOnStartup(): Promise<void> {
-  if (!sessionUsername) return;
+  if (!authToken) return;
   try {
-    const res = await fetch('/api/portfolio', { credentials: 'include' });
+    const res = await fetch('/api/portfolios', {
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
     if (res.status === 401) {
+      authToken = null;
       sessionUsername = null;
       return;
     }
@@ -952,49 +960,154 @@ async function loadPortfolioOnStartup(): Promise<void> {
   } catch (e) {
     console.warn('从服务器加载持仓失败:', e);
   }
+  // 回退到 localStorage
   try {
     const raw = localStorage.getItem(LS_PORTFOLIO_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as { stocks?: unknown; cash?: unknown };
     if (!Array.isArray(parsed.stocks) || parsed.stocks.length === 0) return;
     applyPortfolioFromParsed({ stocks: parsed.stocks, cash: parsed.cash });
-    localStorage.removeItem(LS_PORTFOLIO_KEY);
-    await fetch('/api/portfolio', {
-      method: 'PUT',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildPortfolioPayload())
-    }).catch(() => {});
+    // 尝试迁移到服务器
+    saveToStorage();
   } catch (e) {
     console.error('读取本地旧持仓失败:', e);
   }
 }
 
-async function refreshSession(): Promise<void> {
+// 登录
+async function submitLogin(email: string, password: string): Promise<boolean> {
   try {
-    const r = await fetch('/api/auth/me', { credentials: 'include' });
-    if (r.ok) {
-      const j = (await r.json()) as { username?: string };
-      sessionUsername = typeof j.username === 'string' ? j.username : null;
-    } else {
-      sessionUsername = null;
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || '登录失败');
     }
-  } catch {
-    sessionUsername = null;
+    authToken = data.token;
+    sessionUsername = data.user.email;
+    localStorage.setItem('auth_token', authToken!);
+    await loadPortfolioOnStartup();
+    return true;
+  } catch (e) {
+    console.error('登录失败:', e);
+    throw e;
   }
 }
+
+// 注册
+async function submitRegister(email: string, password: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || '注册失败');
+    }
+    authToken = data.token;
+    sessionUsername = data.user.email;
+    localStorage.setItem('auth_token', authToken!);
+    return true;
+  } catch (e) {
+    console.error('注册失败:', e);
+    throw e;
+  }
+}
+
+// 登出
+function logout(): void {
+  authToken = null;
+  sessionUsername = null;
+  localStorage.removeItem('auth_token');
+  state.stocks = [];
+  state.cash = 0;
+  calculateTotals();
+  render();
+}
+
+// 恢复会话
+async function restoreSession(): Promise<void> {
+  const savedToken = localStorage.getItem('auth_token');
+  if (savedToken) {
+    authToken = savedToken;
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: savedToken }) // 简化：服务端验证 token
+      });
+      if (res.ok) {
+        const data = await res.json();
+        sessionUsername = data.user.email;
+        await loadPortfolioOnStartup();
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    authToken = null;
+    localStorage.removeItem('auth_token');
+  }
+  sessionUsername = null;
+}
+
+// 全局函数供 HTML onclick 调用
+(window as unknown as Record<string, unknown>).submitLogin = async function() {
+  const email = (document.getElementById('auth-user') as HTMLInputElement)?.value;
+  const password = (document.getElementById('auth-pass') as HTMLInputElement)?.value;
+  const msgEl = document.getElementById('auth-msg');
+  if (!email || !password) {
+    if (msgEl) msgEl.textContent = '请填写邮箱和密码';
+    return;
+  }
+  try {
+    await submitLogin(email, password);
+    render();
+  } catch (e) {
+    if (msgEl) msgEl.textContent = (e as Error).message;
+  }
+};
+
+// 全局函数供 HTML onclick 调用
+(window as unknown as Record<string, unknown>).submitRegister = async function() {
+  const email = (document.getElementById('auth-user') as HTMLInputElement)?.value;
+  const password = (document.getElementById('auth-pass') as HTMLInputElement)?.value;
+  const msgEl = document.getElementById('auth-msg');
+  if (!email || !password) {
+    if (msgEl) msgEl.textContent = '请填写邮箱和密码';
+    return;
+  }
+  if (password.length < 6) {
+    if (msgEl) msgEl.textContent = '密码长度至少6位';
+    return;
+  }
+  try {
+    await submitRegister(email, password);
+    render();
+  } catch (e) {
+    if (msgEl) msgEl.textContent = (e as Error).message;
+  }
+};
+
+// 全局函数供 HTML onclick 调用
+(window as unknown as Record<string, unknown>).logout = logout;
 
 function renderAuthScreen(): string {
   const tab = authPanelTab;
   const loginForm = `
     <form onsubmit="event.preventDefault(); submitLoginForm(); return false;">
       <div class="input-group" style="margin-bottom:14px;">
-        <label for="auth-user">用户名</label>
-        <input type="text" id="auth-user" autocomplete="username" required maxlength="32" pattern="[a-zA-Z0-9_]{3,32}" placeholder="3–32 位字母、数字或下划线" />
+        <label for="auth-user">邮箱</label>
+        <input type="email" id="auth-user" autocomplete="email" required placeholder="your@email.com" />
       </div>
       <div class="input-group" style="margin-bottom:18px;">
         <label for="auth-pass">密码</label>
-        <input type="password" id="auth-pass" autocomplete="current-password" required minlength="8" maxlength="128" placeholder="至少 8 位" />
+        <input type="password" id="auth-pass" autocomplete="current-password" required minlength="6" placeholder="至少6位" />
       </div>
       <button type="submit" class="btn btn-primary" style="width:100%;">登录</button>
     </form>
@@ -1002,12 +1115,12 @@ function renderAuthScreen(): string {
   const registerForm = `
     <form onsubmit="event.preventDefault(); submitRegisterForm(); return false;">
       <div class="input-group" style="margin-bottom:14px;">
-        <label for="auth-user">用户名</label>
-        <input type="text" id="auth-user" autocomplete="username" required maxlength="32" pattern="[a-zA-Z0-9_]{3,32}" placeholder="3–32 位字母、数字或下划线" />
+        <label for="auth-user">邮箱</label>
+        <input type="email" id="auth-user" autocomplete="email" required placeholder="your@email.com" />
       </div>
       <div class="input-group" style="margin-bottom:18px;">
         <label for="auth-pass">密码</label>
-        <input type="password" id="auth-pass" autocomplete="new-password" required minlength="8" maxlength="128" placeholder="至少 8 位" />
+        <input type="password" id="auth-pass" autocomplete="new-password" required minlength="6" placeholder="至少6位" />
       </div>
       <button type="submit" class="btn btn-primary" style="width:100%;">注册并登录</button>
     </form>
@@ -1035,6 +1148,7 @@ function switchAuthTab(tab: 'login' | 'register'): void {
   render();
 }
 
+// 表单提交包装函数（供 HTML 表单 onsubmit 调用）
 async function submitLoginForm(): Promise<void> {
   const userEl = document.getElementById('auth-user') as HTMLInputElement | null;
   const passEl = document.getElementById('auth-pass') as HTMLInputElement | null;
@@ -1042,40 +1156,15 @@ async function submitLoginForm(): Promise<void> {
   const u = userEl?.value?.trim() ?? '';
   const p = passEl?.value ?? '';
   if (!u || !p) {
-    if (msg) {
-      msg.style.color = '#b91c1c';
-      msg.textContent = '请填写用户名和密码';
-    }
+    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '请填写邮箱和密码'; }
     return;
   }
   try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: u, password: p })
-    });
-    const data = (await res.json().catch(() => ({}))) as { error?: string; username?: string };
-    if (!res.ok) {
-      if (msg) {
-        msg.style.color = '#b91c1c';
-        msg.textContent = data.error || '登录失败';
-      }
-      return;
-    }
-    sessionUsername = typeof data.username === 'string' ? data.username : u;
-    await loadPortfolioOnStartup();
-    if (msg) {
-      msg.textContent = '';
-      msg.style.color = '';
-    }
-    render();
-    void refreshFinnhubCanonicalEquivalents();
-  } catch {
-    if (msg) {
-      msg.style.color = '#b91c1c';
-      msg.textContent = '网络错误，请稍后重试';
-    }
+    await submitLogin(u, p);
+    if (msg) { msg.style.color = '#15803d'; msg.textContent = '登录成功！'; }
+    setTimeout(render, 500);
+  } catch (e) {
+    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = (e as Error).message; }
   }
 }
 
@@ -1086,40 +1175,19 @@ async function submitRegisterForm(): Promise<void> {
   const u = userEl?.value?.trim() ?? '';
   const p = passEl?.value ?? '';
   if (!u || !p) {
-    if (msg) {
-      msg.style.color = '#b91c1c';
-      msg.textContent = '请填写用户名和密码';
-    }
+    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '请填写邮箱和密码'; }
+    return;
+  }
+  if (p.length < 6) {
+    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '密码至少6位'; }
     return;
   }
   try {
-    const res = await fetch('/api/auth/register', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: u, password: p })
-    });
-    const data = (await res.json().catch(() => ({}))) as { error?: string; username?: string };
-    if (!res.ok) {
-      if (msg) {
-        msg.style.color = '#b91c1c';
-        msg.textContent = data.error || '注册失败';
-      }
-      return;
-    }
-    sessionUsername = typeof data.username === 'string' ? data.username : u;
-    await loadPortfolioOnStartup();
-    if (msg) {
-      msg.textContent = '';
-      msg.style.color = '';
-    }
-    render();
-    void refreshFinnhubCanonicalEquivalents();
-  } catch {
-    if (msg) {
-      msg.style.color = '#b91c1c';
-      msg.textContent = '网络错误，请稍后重试';
-    }
+    await submitRegister(u, p);
+    if (msg) { msg.style.color = '#15803d'; msg.textContent = '注册成功！'; }
+    setTimeout(render, 500);
+  } catch (e) {
+    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = (e as Error).message; }
   }
 }
 
@@ -2084,7 +2152,7 @@ function render(): void {
 
 // 初始化应用（会话 → 持仓；未登录仅展示登录页）
 async function init(): Promise<void> {
-  await refreshSession();
+  await restoreSession();
   if (sessionUsername) {
     await loadPortfolioOnStartup();
   }
