@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 
-PORT=5000
+export PORT=5000
+export HOSTNAME=0.0.0.0
 COZE_WORKSPACE_PATH="${COZE_WORKSPACE_PATH:-$(pwd)}"
 DEPLOY_RUN_PORT=5000
 

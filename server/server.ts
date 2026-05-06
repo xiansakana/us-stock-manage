@@ -10,7 +10,7 @@ import { getPortfolio, savePortfolio, getPositions, addTrade, getTrades, getProf
 
 const isDev = process.env.COZE_PROJECT_ENV !== 'PROD';
 const port = parseInt(process.env.PORT || '5000', 10);
-const hostname = process.env.HOSTNAME || 'localhost';
+const hostname = process.env.HOSTNAME || '0.0.0.0';
 const app = express();
 
 if (process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true') {
@@ -462,8 +462,8 @@ async function startServer(): Promise<Server> {
     process.exit(1);
   });
 
-  server.listen(port, () => {
-    console.log(`\n✨ Server running at http://${hostname}:${port}`);
+  server.listen(port, hostname, () => {
+    console.log(`\n✨ Server running at http://${hostname === '0.0.0.0' ? 'localhost' : hostname}:${port}`);
     console.log(`📝 Environment: ${isDev ? 'development' : 'production'}\n`);
   });
 
