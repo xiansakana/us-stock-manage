@@ -148,6 +148,16 @@ body {
   gap: 8px;
   margin-top: 12px;
   flex-wrap: wrap;
+  width: 100%;
+}
+
+/** 与「导出/导入 JSON·CSV」错开一行：顶部分隔线 + 间距 */
+.trade-panel-block {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #e2e8f0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .table-container {
@@ -196,10 +206,7 @@ table.holdings-table col.holdings-col-type {
   width: 8%;
 }
 table.holdings-table col.holdings-col-symbol {
-  width: 10%;
-}
-table.holdings-table col.holdings-col-name {
-  width: 14%;
+  width: 18%;
 }
 table.holdings-table col.holdings-col-shares {
   width: 5%;
