@@ -1,4 +1,11 @@
 ﻿// 类型定义
+import { computeProfitLoss, deriveHoldingsFromTrades } from './localTrades';
+import {
+  parseBbaeXlsxArrayBuffer,
+  parseMoomooXlsxArrayBuffer,
+  parseTradeImportLegacyCsv
+} from './tradeImport';
+
 type TradeSignal = 'buy' | 'hold' | 'sell';
 
 /** 单笔买入（股数 / 合约张数 + 单价成本），列表展示为加权平均成本 */
@@ -33,12 +40,13 @@ interface Stock {
   groupWith?: string;
 }
 
-// 导出数据结构
+// 导出数据结构（含交易快照便于完整恢复）
 interface ExportData {
   version: string;
   exportDate: string;
   cash: number;
   stocks: Stock[];
+  trades?: TradeRecord[];
 }
 
 // 股票数据接口 (来自后端 API)
@@ -110,17 +118,13 @@ const state: AppState = {
   pnlEndDate: ''
 };
 
-/** 当前登录用户名；null 表示未登录，仅展示登录/注册页 */
-let sessionUsername: string | null = null;
-let authPanelTab: 'login' | 'register' = 'login';
-
 /** 交易面板状态 */
 let tradePanelOpen = false;
 let tradeFormSymbol = '';
 let tradeFormName = '';
+/** 交易表单：true 时代码可编辑（新增交易） */
+let tradeFormFreeEntry = false;
 let tradeFormType: 'buy' | 'sell' = 'buy';
-
-/** 交易记录弹窗状态 */
 let tradeHistoryModalOpen = false;
 let tradeHistoryFilter = {
   symbol: '',
@@ -129,7 +133,9 @@ let tradeHistoryFilter = {
   endDate: ''
 };
 let tradeHistoryPage = 1;
-const tradeHistoryPageSize = 10;
+/** 交易记录弹窗每页条数（可选 10 / 20 / 50 / 100） */
+let tradeHistoryPageSize = 10;
+const TRADE_HISTORY_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 
 /** 编辑交易弹窗状态 */
 let editTradeModalOpen = false;
@@ -149,7 +155,6 @@ let tableSortDir: 1 | -1 = -1;
 type HoldingsColumnKey =
   | 'type'
   | 'symbol'
-  | 'name'
   | 'shares'
   | 'cost'
   | 'price'
@@ -165,7 +170,6 @@ type HoldingsColumnKey =
 const HOLDINGS_COLUMN_META: ReadonlyArray<{ key: HoldingsColumnKey; label: string }> = [
   { key: 'type', label: '类型' },
   { key: 'symbol', label: '代码' },
-  { key: 'name', label: '名称' },
   { key: 'shares', label: '股数' },
   { key: 'cost', label: '成本' },
   { key: 'price', label: '现价' },
@@ -182,7 +186,6 @@ const HOLDINGS_COLUMN_META: ReadonlyArray<{ key: HoldingsColumnKey; label: strin
 const HOLDINGS_COL_SUFFIX: Record<HoldingsColumnKey, string> = {
   type: 'type',
   symbol: 'symbol',
-  name: 'name',
   shares: 'shares',
   cost: 'cost',
   price: 'price',
@@ -292,8 +295,11 @@ function getStockDisplayName(ticker: string): string {
 
 const FINNHUB_EQ_LS_KEY = 'portfolioFinnhubUnderlyingEq';
 
-/** 旧版浏览器本地持仓键；启动时若服务端无数据则迁移一次并删除 */
+/** 浏览器本地持仓（JSON） */
 const LS_PORTFOLIO_KEY = 'stockPortfolio';
+
+/** 浏览器本地交易记录（JSON 数组） */
+const LS_TRADES_KEY = 'stockTrades';
 
 /** Finnhub /symbol/canonical-underlying 推断结果缓存（含「映射为自身」以避免重复请求） */
 function loadFinnhubUnderlyingEqCache(): Record<string, string> {
@@ -324,7 +330,7 @@ function collectRawTickersForGrouping(): string[] {
   for (const s of state.stocks) {
     const sym = s.symbol.trim().toUpperCase();
     if (s.type === 'option' || isOptionSymbol(sym)) {
-      const full = sym.match(/^([A-Z]+)\d{6}[CP]\d+$/i);
+      const full = sym.match(/^([A-Z]+)\d{6}[CP]\d+(?:\.\d+)?$/i);
       if (full) set.add(full[1]);
     } else {
       set.add(sym);
@@ -376,14 +382,100 @@ function resolveCanonicalUnderlying(ticker: string): string {
 
 /** 与后端 parseOptionSymbol 一致：标的 + YYMMDD + C/P + 行权价 */
 function isOptionSymbol(symbol: string): boolean {
-  return /^[A-Z]+\d{6}[CP]\d+$/i.test(symbol.trim());
+  return /^[A-Z]+\d{6}[CP]\d+(?:\.\d+)?$/i.test(symbol.trim());
+}
+
+/** 从标准期权码解析展示字段（与表格期权列一致） */
+function parseOptionFieldsFromSymbol(symbol: string): Pick<Stock, 'optionStrike' | 'optionExpiry' | 'optionType'> | undefined {
+  const sym = symbol.trim().toUpperCase();
+  const m = sym.match(/^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d+(?:\.\d+)?)$/);
+  if (!m) return undefined;
+  const [, , yy, mm, dd, cp, strikeStr] = m;
+  return {
+    optionStrike: parseFloat(strikeStr),
+    optionExpiry: `20${yy}-${mm}-${dd}`,
+    optionType: cp.toUpperCase() === 'P' ? 'P' : 'C'
+  };
+}
+
+/** 从本地持仓快照生成首笔买入（仅当尚无交易记录时执行一次） */
+function migratePortfolioStocksToTradesIfNeeded(): void {
+  if (state.trades.length > 0) return;
+  if (state.stocks.length === 0) return;
+  const toAdd: TradeRecord[] = [];
+  for (const s of state.stocks) {
+    if (s.shares <= 0) continue;
+    const price =
+      s.avgCost !== undefined && Number.isFinite(Number(s.avgCost)) && Number(s.avgCost) > 0
+        ? Number(s.avgCost)
+        : s.currentPrice > 0
+          ? s.currentPrice
+          : 0;
+    if (price <= 0) continue;
+    const shares = s.shares;
+    const optMult = isOptionSymbol(s.symbol) ? 100 : 1;
+    toAdd.push({
+      id: crypto.randomUUID(),
+      symbol: s.symbol,
+      name: s.name || s.symbol,
+      type: 'buy',
+      shares,
+      price,
+      total_amount: shares * price * optMult,
+      commission: 0,
+      trade_date: new Date().toISOString(),
+      created_at: new Date().toISOString()
+    });
+  }
+  if (toAdd.length === 0) return;
+  state.trades.push(...toAdd);
+  sortTradesByDateDesc(state.trades);
+  try {
+    localStorage.setItem(LS_TRADES_KEY, JSON.stringify(state.trades));
+  } catch (e) {
+    console.error('迁移写入交易记录失败:', e);
+  }
+}
+
+/** 用交易记录 FIFO 汇总持仓；无交易时清空持仓表 */
+function syncStocksFromTrades(): void {
+  if (state.trades.length === 0) {
+    calculateTotals();
+    return;
+  }
+  const prevBySym = new Map(state.stocks.map((s) => [s.symbol, s]));
+  const derived = deriveHoldingsFromTrades(state.trades);
+  state.stocks = derived.map((d) => {
+    const prev = prevBySym.get(d.symbol);
+    const isOpt = isOptionSymbol(d.symbol);
+    const optFields = isOpt ? parseOptionFieldsFromSymbol(d.symbol) : undefined;
+    return {
+      symbol: d.symbol,
+      name: d.name,
+      shares: d.shares,
+      avgCost: d.avgCost,
+      costLots: d.costLots.map((lot) => ({ shares: lot.shares, costPerShare: lot.costPerShare })),
+      currentPrice: prev?.currentPrice ?? 0,
+      position: 0,
+      weight: 0,
+      signal: prev?.signal ?? 'hold',
+      targetPrice: prev?.targetPrice,
+      groupWith: prev?.groupWith,
+      type: isOpt ? 'option' : 'stock',
+      instrumentType: prev?.instrumentType,
+      optionStrike: prev?.optionStrike ?? optFields?.optionStrike,
+      optionExpiry: prev?.optionExpiry ?? optFields?.optionExpiry,
+      optionType: prev?.optionType ?? optFields?.optionType
+    };
+  });
+  calculateTotals();
 }
 
 /** 从合约/代码得到原始标的 ticker（未合并） */
 function extractRawTickerForStock(stock: Stock): string {
   const sym = stock.symbol.trim().toUpperCase();
   if (stock.type === 'option' || isOptionSymbol(sym)) {
-    const full = sym.match(/^([A-Z]+)\d{6}[CP]\d+$/i);
+    const full = sym.match(/^([A-Z]+)\d{6}[CP]\d+(?:\.\d+)?$/i);
     if (full) return full[1];
     const prefix = sym.match(/^([A-Z]+)/);
     return prefix ? prefix[1] : sym;
@@ -556,101 +648,13 @@ function formatCostLotsModalRows(lots: CostLot[]): string {
 }
 
 function openCostLotsEditor(symbol: string): void {
-  document.getElementById('cost-lots-modal-root')?.remove();
+  void symbol;
+  renderError('成本由买入交易按 FIFO 自动计算，请编辑对应买入记录。');
+}
 
-  const stock = state.stocks.find(s => s.symbol === symbol);
-  if (!stock) return;
-
-  const isOpt = stock.type === 'option' || isOptionSymbol(stock.symbol);
-  const unitLabel = isOpt ? '数量（张）' : '股数';
-  const costLabel = isOpt ? '每份合约成本 ($)' : '每股成本 ($)';
-
-  let lots: CostLot[] =
-    stock.costLots && stock.costLots.length > 0
-      ? stock.costLots.map(l => ({ shares: l.shares, costPerShare: l.costPerShare }))
-      : [{ shares: stock.shares || 0, costPerShare: stock.avgCost ?? 0 }];
-
-  const root = document.createElement('div');
-  root.id = 'cost-lots-modal-root';
-  root.style.cssText =
-    'position:fixed;inset:0;background:rgba(15,23,42,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;';
-
-  function redraw(): void {
-    const tbody = root.querySelector('#cost-lots-modal-tbody');
-    if (tbody) tbody.innerHTML = formatCostLotsModalRows(lots);
-    bindLotEvents();
-  }
-
-  function bindLotEvents(): void {
-    root.querySelectorAll('.lot-remove-btn').forEach(btn => {
-      btn.addEventListener('click', e => {
-        const tr = (e.target as HTMLElement).closest('tr');
-        const idx = tr ? parseInt(tr.getAttribute('data-lot-index') || '-1', 10) : -1;
-        if (idx < 0) return;
-        lots = lots.filter((_, i) => i !== idx);
-        if (lots.length === 0) lots = [{ shares: 0, costPerShare: 0 }];
-        redraw();
-      });
-    });
-  }
-
-  root.innerHTML = `
-    <div style="background:#fff;border-radius:16px;max-width:520px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.25);overflow:hidden;">
-      <div style="padding:18px 20px;border-bottom:1px solid #e5e7eb;">
-        <h2 style="margin:0;font-size:1.15rem;color:#0f172a;">编辑买入明细 · ${escapeHtml(symbol)}</h2>
-        <p style="margin:8px 0 0 0;font-size:0.82rem;color:#64748b;">保存后列表中的股数与成本为<strong>合计股数</strong>与<strong>加权平均成本</strong>。</p>
-      </div>
-      <div style="padding:16px 20px;">
-        <table style="width:100%;border-collapse:collapse;font-size:0.9rem;">
-          <thead>
-            <tr style="background:linear-gradient(135deg,#475569 0%,#334155 100%);color:#fff;text-align:left;">
-              <th style="padding:10px 12px;font-weight:600;border-radius:10px 0 0 0;">${unitLabel}</th>
-              <th style="padding:10px 12px;font-weight:600;">${costLabel}</th>
-              <th style="padding:10px 12px;width:72px;border-radius:0 10px 0 0;"></th>
-            </tr>
-          </thead>
-          <tbody id="cost-lots-modal-tbody">${formatCostLotsModalRows(lots)}</tbody>
-        </table>
-        <button type="button" id="cost-lots-add-row" class="btn btn-secondary" style="margin-top:12px;padding:8px 14px;font-size:0.85rem;">+ 添加一笔</button>
-      </div>
-      <div style="padding:14px 20px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:10px;background:#f8fafc;">
-        <button type="button" id="cost-lots-cancel" class="btn btn-secondary" style="padding:8px 18px;">取消</button>
-        <button type="button" id="cost-lots-save" class="btn btn-primary" style="padding:8px 18px;">保存</button>
-      </div>
-    </div>
-  `;
-
-  document.body.appendChild(root);
-  bindLotEvents();
-
-  root.addEventListener('click', e => {
-    if (e.target === root) root.remove();
-  });
-
-  root.querySelector('#cost-lots-add-row')?.addEventListener('click', () => {
-    lots.push({ shares: 0, costPerShare: 0 });
-    redraw();
-  });
-
-  root.querySelector('#cost-lots-cancel')?.addEventListener('click', () => root.remove());
-
-  root.querySelector('#cost-lots-save')?.addEventListener('click', () => {
-    const tbody = root.querySelector('#cost-lots-modal-tbody');
-    if (!tbody || !stock) return;
-    const next: CostLot[] = [];
-    tbody.querySelectorAll('tr').forEach(tr => {
-      const sh = parseFloat((tr.querySelector('.lot-shares-input') as HTMLInputElement)?.value || '0') || 0;
-      const c = parseFloat((tr.querySelector('.lot-cost-input') as HTMLInputElement)?.value || '0') || 0;
-      if (sh > 0) next.push({ shares: sh, costPerShare: c });
-    });
-    stock.costLots = next.length > 0 ? next : undefined;
-    syncStockCostFromLots(stock);
-    root.remove();
-    calculateTotals();
-    saveToStorage();
-    render();
-    renderSuccess(`已更新 ${symbol} 持仓成本`);
-  });
+function removeStock(symbol: string): void {
+  void symbol;
+  renderError('持仓由交易汇总，请使用「卖出」或调整交易记录。');
 }
 
 /** 按标的分组排序：先正股后期权，再按代码 */
@@ -679,6 +683,12 @@ function escapeHtmlAttr(s: string): string {
 // 工具函数：格式化数字
 function formatNumber(num: number, decimals: number = 2): string {
   return num.toFixed(decimals);
+}
+
+/** `<input type="datetime-local" step="60">` 用的本地时间字符串（精确到分钟） */
+function formatDatetimeLocalMinute(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 /** CSV 旧版单列「类型」：期权 / 股票 / Finnhub 证券类型 */
@@ -746,10 +756,23 @@ function renderSuccess(message: string): void {
 
 // ========== 交易 UI 函数 ==========
 
-// 打开交易表单
+// 打开交易表单（从持仓行打开：代码/名称只读）
 function openTradeForm(symbol: string, name: string, type: 'buy' | 'sell'): void {
-  tradeFormSymbol = symbol;
+  tradeFormFreeEntry = false;
+  tradeFormSymbol = symbol.trim().toUpperCase();
   tradeFormName = name;
+  tradeFormType = type;
+  tradePanelOpen = true;
+  render();
+}
+
+/** 新增交易：可编辑代码；若顶部搜索框有内容会预填代码；保存时名称与代码一致 */
+function openNewTradeForm(type: 'buy' | 'sell'): void {
+  const inp = document.getElementById('symbol') as HTMLInputElement | null;
+  const raw = (inp?.value ?? '').trim().toUpperCase();
+  tradeFormFreeEntry = true;
+  tradeFormSymbol = raw;
+  tradeFormName = '';
   tradeFormType = type;
   tradePanelOpen = true;
   render();
@@ -758,6 +781,7 @@ function openTradeForm(symbol: string, name: string, type: 'buy' | 'sell'): void
 // 关闭交易表单
 function closeTradeForm(): void {
   tradePanelOpen = false;
+  tradeFormFreeEntry = false;
   render();
 }
 
@@ -776,7 +800,7 @@ function closeEditTradeModal(): void {
 }
 
 // 提交编辑交易
-async function submitEditTrade(): Promise<void> {
+function submitEditTrade(): void {
   if (!editingTrade) return;
   
   const sharesEl = document.getElementById('edit-trade-shares') as HTMLInputElement | null;
@@ -787,34 +811,45 @@ async function submitEditTrade(): Promise<void> {
   const shares = parseFloat(sharesEl?.value || '0');
   const price = parseFloat(priceEl?.value || '0');
   const commission = parseFloat(commissionEl?.value || '0');
-  const tradeDate = dateEl?.value || '';
-  
+  const rawDt = (dateEl?.value ?? '').trim();
+  let tradeAtIso: string | undefined;
+  if (rawDt) {
+    const tradeAt = new Date(rawDt);
+    if (Number.isNaN(tradeAt.getTime())) {
+      renderError('交易时间无效');
+      return;
+    }
+    if (tradeAt.getTime() > Date.now()) {
+      renderError('交易时间不能晚于当前时刻');
+      return;
+    }
+    tradeAtIso = tradeAt.toISOString();
+  }
+
   if (shares <= 0 || price <= 0) {
     renderError('股数和价格必须大于 0');
     return;
   }
+
+  const success = updateTradeRecord(editingTrade.id, {
+    shares,
+    price,
+    commission,
+    trade_date: tradeAtIso
+  });
   
-  try {
-    const success = await updateTradeRecord(editingTrade.id, {
-      shares,
-      price,
-      commission,
-      trade_date: tradeDate ? new Date(tradeDate).toISOString() : undefined
-    });
-    
-    if (success) {
-      await loadTradesFiltered();
-      render();
-      renderSuccess('交易记录已更新');
-      closeEditTradeModal();
-    }
-  } catch (e) {
-    renderError((e as Error).message);
+  if (success) {
+    loadPnlStatsOnStartup();
+    renderSuccess('交易记录已更新');
+    closeEditTradeModal();
+    render();
+  } else {
+    renderError('更新失败：未找到该笔交易');
   }
 }
 
 // 提交交易
-async function submitTrade(): Promise<void> {
+function submitTrade(): void {
   const sharesEl = document.getElementById('trade-shares') as HTMLInputElement | null;
   const priceEl = document.getElementById('trade-price') as HTMLInputElement | null;
   const commissionEl = document.getElementById('trade-commission') as HTMLInputElement | null;
@@ -823,33 +858,58 @@ async function submitTrade(): Promise<void> {
   const shares = parseFloat(sharesEl?.value || '0');
   const price = parseFloat(priceEl?.value || '0');
   const commission = parseFloat(commissionEl?.value || '0');
-  const tradeDate = dateEl?.value || new Date().toISOString().split('T')[0];
+  const rawDt = (dateEl?.value ?? '').trim();
+  let tradeAt: Date;
+  if (!rawDt) {
+    tradeAt = new Date();
+  } else {
+    tradeAt = new Date(rawDt);
+    if (Number.isNaN(tradeAt.getTime())) {
+      renderError('交易时间无效');
+      return;
+    }
+    if (tradeAt.getTime() > Date.now()) {
+      renderError('交易时间不能晚于当前时刻');
+      return;
+    }
+  }
+
+  let sym = tradeFormSymbol.trim().toUpperCase();
+  let trName: string;
+  if (tradeFormFreeEntry) {
+    const symIn = document.getElementById('trade-symbol-input') as HTMLInputElement | null;
+    sym = (symIn?.value ?? '').trim().toUpperCase();
+    trName = '';
+  } else {
+    trName = tradeFormName.trim();
+  }
+
+  if (!sym) {
+    renderError('请填写标的代码');
+    return;
+  }
+  if (!trName) trName = sym;
   
   if (shares <= 0 || price <= 0) {
     renderError('股数和价格必须大于 0');
     return;
   }
   
-  try {
-    const success = await addTradeRecord({
-      symbol: tradeFormSymbol,
-      name: tradeFormName,
-      type: tradeFormType,
-      shares,
-      price,
-      commission,
-      trade_date: new Date(tradeDate).toISOString()
-    });
-    
-    if (success) {
-      // 重新加载交易数据
-      await loadTradeDataOnStartup();
-      render();
-      renderSuccess(`${tradeFormType === 'buy' ? '买入' : '卖出'}成功：${shares} 股 ${tradeFormSymbol} @ $${price}`);
-      closeTradeForm();
-    }
-  } catch (e) {
-    renderError((e as Error).message);
+  const success = addTradeRecord({
+    symbol: sym,
+    name: trName,
+    type: tradeFormType,
+    shares,
+    price,
+    commission,
+    trade_date: tradeAt.toISOString()
+  });
+  
+  if (success) {
+    loadPnlStatsOnStartup();
+    renderSuccess(`${tradeFormType === 'buy' ? '买入' : '卖出'}成功：${shares} 股 ${sym} @ $${price}`);
+    closeTradeForm();
+    render();
   }
 }
 
@@ -860,25 +920,14 @@ function setTradeType(type: 'buy' | 'sell'): void {
 }
 
 // 删除交易记录
-async function handleDeleteTrade(tradeId: string, symbol: string): Promise<void> {
+function handleDeleteTrade(tradeId: string, symbol: string): void {
   if (!confirm(`确定删除这笔 ${symbol} 的交易记录吗？`)) return;
   
-  const success = await deleteTradeRecord(tradeId);
-  if (success) {
-    await loadTradeDataOnStartup();
-    render();
+  if (deleteTradeRecord(tradeId)) {
+    loadPnlStatsOnStartup();
     renderSuccess('交易记录已删除');
+    render();
   }
-}
-
-// 刷新盈亏统计
-async function refreshPnlStats(): Promise<void> {
-  const pnlStats = await loadPnlStats({
-    startDate: state.pnlStartDate || undefined,
-    endDate: state.pnlEndDate || undefined
-  });
-  state.pnlStats = pnlStats;
-  render();
 }
 
 // 刷新单个股票/期权价格
@@ -1080,39 +1129,29 @@ function buildPortfolioPayload(): {
 let persistDebounceId: ReturnType<typeof setTimeout> | null = null;
 const PERSIST_DEBOUNCE_MS = 400;
 
-let authToken: string | null = null;
+function sortTradesByDateDesc(trades: TradeRecord[]): void {
+  trades.sort((a, b) => new Date(b.trade_date).getTime() - new Date(a.trade_date).getTime());
+}
 
-/** 防抖写入服务端数据库（需登录） */
+function flushPersistToLocal(): void {
+  if (persistDebounceId !== null) {
+    clearTimeout(persistDebounceId);
+    persistDebounceId = null;
+  }
+  try {
+    localStorage.setItem(LS_PORTFOLIO_KEY, JSON.stringify(buildPortfolioPayload()));
+    localStorage.setItem(LS_TRADES_KEY, JSON.stringify(state.trades));
+  } catch (e) {
+    console.error('写入本地存储失败:', e);
+  }
+}
+
+/** 防抖写入本地存储（持仓 + 交易记录） */
 function saveToStorage(): void {
-  if (!authToken) return;
-  const data = buildPortfolioPayload();
   if (persistDebounceId !== null) clearTimeout(persistDebounceId);
   persistDebounceId = setTimeout(() => {
     persistDebounceId = null;
-    void (async () => {
-      try {
-        const res = await fetch('/api/portfolios', {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${authToken}`
-          },
-          body: JSON.stringify(data)
-        });
-        if (res.status === 401) {
-          authToken = null;
-          sessionUsername = null;
-          state.stocks = [];
-          state.cash = 0;
-          calculateTotals();
-          render();
-          return;
-        }
-        if (!res.ok) console.error('同步到服务器失败:', res.status);
-      } catch (e) {
-        console.error('同步到服务器失败:', e);
-      }
-    })();
+    flushPersistToLocal();
   }, PERSIST_DEBOUNCE_MS);
 }
 
@@ -1134,73 +1173,75 @@ function applyPortfolioFromParsed(parsed: { stocks: unknown; cash?: unknown }): 
   calculateTotals();
 }
 
-async function loadPortfolioOnStartup(): Promise<void> {
-  if (!authToken) return;
-  try {
-    const res = await fetch('/api/portfolios', {
-      headers: { 'Authorization': `Bearer ${authToken}` }
-    });
-    if (res.status === 401) {
-      authToken = null;
-      sessionUsername = null;
-      return;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const parsed = (await res.json()) as { stocks?: unknown; cash?: unknown };
-    const stocksArr = Array.isArray(parsed.stocks) ? parsed.stocks : [];
-    const cashNum = typeof parsed.cash === 'number' && Number.isFinite(parsed.cash) ? parsed.cash : 0;
-    const hasServerData = stocksArr.length > 0 || cashNum !== 0;
-    if (hasServerData) {
-      applyPortfolioFromParsed({ stocks: stocksArr, cash: cashNum });
-      return;
-    }
-  } catch (e) {
-    console.warn('从服务器加载持仓失败:', e);
-  }
-  // 回退到 localStorage
+function loadPersistedPortfolio(): void {
   try {
     const raw = localStorage.getItem(LS_PORTFOLIO_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as { stocks?: unknown; cash?: unknown };
-    if (!Array.isArray(parsed.stocks) || parsed.stocks.length === 0) return;
-    applyPortfolioFromParsed({ stocks: parsed.stocks, cash: parsed.cash });
-    // 尝试迁移到服务器
-    saveToStorage();
+    const stocksArr = Array.isArray(parsed.stocks) ? parsed.stocks : [];
+    const cashNum = typeof parsed.cash === 'number' && Number.isFinite(parsed.cash) ? parsed.cash : 0;
+    if (stocksArr.length === 0 && cashNum === 0) return;
+    applyPortfolioFromParsed({ stocks: stocksArr, cash: cashNum });
   } catch (e) {
-    console.error('读取本地旧持仓失败:', e);
+    console.error('读取本地持仓失败:', e);
   }
 }
 
-// ========== 交易相关 API ==========
-
-// 加载交易记录
-async function loadTrades(options?: { symbol?: string; startDate?: string; endDate?: string; limit?: string }): Promise<TradeRecord[]> {
-  if (!authToken) return [];
-  
-  const params = new URLSearchParams();
-  if (options?.symbol) params.append('symbol', options.symbol);
-  if (options?.startDate) params.append('startDate', options.startDate);
-  if (options?.endDate) params.append('endDate', options.endDate);
-  if (options?.limit) params.append('limit', options.limit);
-  
+function parseTradesFromLocalStorage(raw: string | null): TradeRecord[] {
+  if (!raw) return [];
   try {
-    const res = await fetch(`/api/trades?${params.toString()}`, {
-      headers: { 'Authorization': `Bearer ${authToken}` }
-    });
-    if (res.status === 401) {
-      return [];
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return [];
+    const out: TradeRecord[] = [];
+    for (const item of arr) {
+      if (!item || typeof item !== 'object') continue;
+      const o = item as Record<string, unknown>;
+      const id = String(o.id ?? '');
+      const symbol = String(o.symbol ?? '').trim().toUpperCase();
+      if (!symbol) continue;
+      const shares = Number(o.shares);
+      const price = Number(o.price);
+      if (!Number.isFinite(shares) || !Number.isFinite(price) || shares <= 0 || price <= 0) continue;
+      const totalRaw = Number(o.total_amount);
+      const commissionRaw = Number(o.commission);
+      out.push({
+        id: id || crypto.randomUUID(),
+        symbol,
+        name: String(o.name ?? ''),
+        type: o.type === 'sell' ? 'sell' : 'buy',
+        shares,
+        price,
+        total_amount:
+          Number.isFinite(totalRaw) && totalRaw > 0
+            ? totalRaw
+            : shares * price * (isOptionSymbol(symbol) ? 100 : 1),
+        commission: Number.isFinite(commissionRaw) ? commissionRaw : 0,
+        trade_date: String(o.trade_date ?? new Date().toISOString()),
+        created_at: String(o.created_at ?? new Date().toISOString())
+      });
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json() as { trades: TradeRecord[] };
-    return data.trades || [];
-  } catch (e) {
-    console.error('加载交易记录失败:', e);
+    sortTradesByDateDesc(out);
+    return out;
+  } catch {
     return [];
   }
 }
 
-// 添加交易记录
-async function addTradeRecord(trade: {
+function loadPersistedTrades(): void {
+  state.trades = parseTradesFromLocalStorage(localStorage.getItem(LS_TRADES_KEY));
+}
+
+// ========== 交易记录（本地存储） ==========
+
+/** 单笔交易对现金的净变动：买入付出本金+手续费；卖出收回本金−手续费 */
+function cashDeltaForTrade(trade: Pick<TradeRecord, 'type' | 'total_amount' | 'commission'>): number {
+  const fee = Number(trade.commission) || 0;
+  const notional = trade.total_amount;
+  if (trade.type === 'buy') return -(notional + fee);
+  return notional - fee;
+}
+
+function addTradeRecord(trade: {
   symbol: string;
   name: string;
   type: 'buy' | 'sell';
@@ -1208,86 +1249,79 @@ async function addTradeRecord(trade: {
   price: number;
   commission?: number;
   trade_date?: string;
-}): Promise<boolean> {
-  if (!authToken) return false;
-  
-  try {
-    const res = await fetch('/api/trades', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authToken}`
-      },
-      body: JSON.stringify(trade)
-    });
-    if (res.status === 401) {
-      authToken = null;
-      sessionUsername = null;
-      return false;
-    }
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || '添加交易失败');
-    }
-    return true;
-  } catch (e) {
-    console.error('添加交易失败:', e);
-    throw e;
-  }
+}): boolean {
+  const shares = trade.shares;
+  const price = trade.price;
+  if (shares <= 0 || price <= 0) return false;
+  const optMult = isOptionSymbol(trade.symbol) ? 100 : 1;
+  const total_amount = shares * price * optMult;
+  const row: TradeRecord = {
+    id: crypto.randomUUID(),
+    symbol: trade.symbol.trim().toUpperCase(),
+    name: trade.name,
+    type: trade.type,
+    shares,
+    price,
+    total_amount,
+    commission: trade.commission ?? 0,
+    trade_date: trade.trade_date ?? new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+  state.cash += cashDeltaForTrade(row);
+  state.trades.push(row);
+  sortTradesByDateDesc(state.trades);
+  flushPersistToLocal();
+  syncStocksFromTrades();
+  return true;
 }
 
-// 删除交易记录
-async function deleteTradeRecord(tradeId: string): Promise<boolean> {
-  if (!authToken) return false;
-  
-  try {
-    const res = await fetch(`/api/trades/${tradeId}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${authToken}` }
-    });
-    if (res.status === 401) {
-      authToken = null;
-      sessionUsername = null;
-      return false;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return true;
-  } catch (e) {
-    console.error('删除交易失败:', e);
-    return false;
+function deleteTradeRecord(tradeId: string): boolean {
+  const removed = state.trades.find((t) => t.id === tradeId);
+  if (!removed) return false;
+  state.cash -= cashDeltaForTrade(removed);
+  state.trades = state.trades.filter((t) => t.id !== tradeId);
+  flushPersistToLocal();
+  if (state.trades.length === 0) {
+    state.stocks = [];
+    calculateTotals();
+  } else {
+    syncStocksFromTrades();
   }
+  return true;
 }
 
-// 更新交易记录
-async function updateTradeRecord(
-  tradeId: string, 
+function updateTradeRecord(
+  tradeId: string,
   updates: { shares?: number; price?: number; commission?: number; trade_date?: string }
-): Promise<boolean> {
-  if (!authToken) return false;
-  
-  try {
-    const res = await fetch(`/api/trades/${tradeId}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authToken}`
-      },
-      body: JSON.stringify(updates)
-    });
-    if (res.status === 401) {
-      authToken = null;
-      sessionUsername = null;
-      return false;
-    }
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || `HTTP ${res.status}`);
-    }
-    return true;
-  } catch (e) {
-    console.error('更新交易失败:', e);
-    throw e;
+): boolean {
+  const t = state.trades.find((x) => x.id === tradeId);
+  if (!t) return false;
+  const oldSnap: Pick<TradeRecord, 'type' | 'total_amount' | 'commission'> = {
+    type: t.type,
+    total_amount: t.total_amount,
+    commission: t.commission
+  };
+  if (updates.shares !== undefined) {
+    if (updates.shares <= 0) return false;
+    t.shares = updates.shares;
   }
+  if (updates.price !== undefined) {
+    if (updates.price <= 0) return false;
+    t.price = updates.price;
+  }
+  if (updates.commission !== undefined) {
+    if (updates.commission < 0) return false;
+    t.commission = updates.commission;
+  }
+  if (updates.trade_date !== undefined) {
+    t.trade_date = updates.trade_date;
+  }
+  t.total_amount = t.shares * t.price * (isOptionSymbol(t.symbol) ? 100 : 1);
+  state.cash += cashDeltaForTrade(t) - cashDeltaForTrade(oldSnap);
+  sortTradesByDateDesc(state.trades);
+  flushPersistToLocal();
+  syncStocksFromTrades();
+  return true;
 }
 
 // 导出交易记录为 CSV
@@ -1370,122 +1404,90 @@ function closeImportTradeModal(): void {
   render();
 }
 
-// 处理文件导入
-function handleFileImport(event: Event): void {
+function readXlsxArrayBuffer(
+  file: File,
+  input: HTMLInputElement,
+  parser: (buf: ArrayBuffer) => Promise<TradeRecord[]>,
+  emptyMessage: string
+): void {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    void (async () => {
+      try {
+        const buf = e.target?.result;
+        if (!(buf instanceof ArrayBuffer)) {
+          importError = '无法读取表格文件';
+          importPreviewData = [];
+          input.value = '';
+          render();
+          return;
+        }
+        importPreviewData = await parser(buf);
+        importError = importPreviewData.length === 0 ? emptyMessage : null;
+      } catch (err) {
+        importError = `解析 Excel 失败: ${(err as Error).message}`;
+        importPreviewData = [];
+      }
+      input.value = '';
+      render();
+    })();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+/** Moomoo：历史 / 现金账户 xlsx */
+function handleMoomooTradeImport(event: Event): void {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
-  
+  readXlsxArrayBuffer(file, input, async (buf) =>
+    (await parseMoomooXlsxArrayBuffer(buf)) as TradeRecord[]
+  , '未解析到有效记录：请确认 xlsx 为 Moomoo 历史导出，且表头含方向、代码、交易状态、成交金额等（仅导入「全部成交」）');
+}
+
+/** BBAE：股票 / 期权订单 xlsx */
+function handleBbaeTradeImport(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  readXlsxArrayBuffer(file, input, async (buf) =>
+    (await parseBbaeXlsxArrayBuffer(buf)) as TradeRecord[]
+  , '未解析到有效记录：请确认 xlsx 为 BBAE 订单导出（工作表含「股票代码」或「期权代码」，订单状态为「已成」）');
+}
+
+/** 本应用导出的交易 CSV / JSON */
+function handleTradeBackupImport(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
     try {
-      const ext = file.name.split('.').pop()?.toLowerCase();
-      
       if (ext === 'csv') {
-        importPreviewData = parseCSV(content);
+        importPreviewData = parseTradeImportLegacyCsv(content) as TradeRecord[];
       } else if (ext === 'json') {
         importPreviewData = parseJSON(content);
       } else {
-        importError = '不支持的文件格式，请上传 CSV 或 JSON 文件';
+        importError = '请上传本应用导出的 .csv 或 .json';
+        importPreviewData = [];
+        input.value = '';
         render();
         return;
       }
-      
-      if (importPreviewData.length === 0) {
-        importError = '文件中没有有效的交易记录';
-      } else {
-        importError = null;
-      }
-      render();
+      importError =
+        importPreviewData.length === 0
+          ? '文件中无有效交易记录（需为本应用「导出交易」的 CSV/JSON）'
+          : null;
     } catch (err) {
-      importError = `解析文件失败: ${(err as Error).message}`;
+      importError = `解析失败: ${(err as Error).message}`;
       importPreviewData = [];
-      render();
     }
+    input.value = '';
+    render();
   };
   reader.readAsText(file);
-}
-
-// 解析 CSV
-function parseCSV(content: string): TradeRecord[] {
-  const lines = content.split('\n').filter(line => line.trim());
-  if (lines.length < 2) return [];
-  
-  const trades: TradeRecord[] = [];
-  
-  for (let i = 1; i < lines.length; i++) {
-    const cells = parseCSVLine(lines[i]);
-    if (cells.length >= 5) {
-      const trade = {
-        id: `import-${i}-${Date.now()}`,
-        symbol: cells[2]?.trim() || cells[1]?.trim() || '',
-        name: cells[3]?.trim() || '',
-        type: (cells[1]?.trim() === '买入' || cells[1]?.toLowerCase() === 'buy') ? 'buy' as const : 'sell' as const,
-        shares: parseFloat(cells[4]?.trim() || '0'),
-        price: parseFloat(cells[5]?.trim() || '0'),
-        total_amount: parseFloat(cells[6]?.trim() || '0'),
-        commission: parseFloat(cells[7]?.trim() || '0'),
-        trade_date: parseCSVDate(cells[0]),
-        created_at: new Date().toISOString()
-      };
-      
-      if (trade.symbol && trade.shares > 0 && trade.price > 0) {
-        if (trade.total_amount === 0) {
-          trade.total_amount = trade.shares * trade.price;
-        }
-        trades.push(trade);
-      }
-    }
-  }
-  
-  return trades;
-}
-
-// 解析 CSV 行
-function parseCSVLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-  
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (char === ',' && !inQuotes) {
-      result.push(current);
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
-// 解析 CSV 日期
-function parseCSVDate(dateStr: string): string {
-  const str = dateStr?.trim().replace(/"/g, '');
-  if (!str) return new Date().toISOString();
-  
-  // 尝试解析常见格式
-  const date = new Date(str);
-  if (!isNaN(date.getTime())) {
-    return date.toISOString();
-  }
-  
-  // 尝试中文格式
-  const cnMatch = str.match(/(\d{4})[年/](\d{1,2})[月/](\d{1,2})/);
-  if (cnMatch) {
-    return new Date(parseInt(cnMatch[1]), parseInt(cnMatch[2]) - 1, parseInt(cnMatch[3])).toISOString();
-  }
-  
-  return new Date().toISOString();
 }
 
 // 解析 JSON
@@ -1497,15 +1499,20 @@ function parseJSON(content: string): TradeRecord[] {
     const type = (item.type as string);
     const shares = parseFloat(String(item.shares || 0));
     const price = parseFloat(String(item.price || 0));
-    
+    const symbolU = String(item.symbol || item.code || '').toUpperCase();
+    let totalAmt = parseFloat(String(item.total_amount || item.amount || ''));
+    if (!Number.isFinite(totalAmt) || totalAmt <= 0) {
+      totalAmt = shares * price * (isOptionSymbol(symbolU) ? 100 : 1);
+    }
+
     return {
       id: `import-${index}-${Date.now()}`,
-      symbol: String(item.symbol || item.code || '').toUpperCase(),
+      symbol: symbolU,
       name: String(item.name || item.stockName || ''),
       type: (type === '买入' || type === 'buy' || type === 'BUY') ? 'buy' as const : 'sell' as const,
       shares,
       price,
-      total_amount: parseFloat(String(item.total_amount || item.amount || shares * price)),
+      total_amount: totalAmt,
       commission: parseFloat(String(item.commission || item.fee || 0)),
       trade_date: item.trade_date ? new Date(item.trade_date as string).toISOString() : new Date().toISOString(),
       created_at: new Date().toISOString()
@@ -1514,40 +1521,47 @@ function parseJSON(content: string): TradeRecord[] {
 }
 
 // 确认导入
-async function confirmImportTrades(): Promise<void> {
+function confirmImportTrades(): void {
   if (importPreviewData.length === 0) {
     renderError('没有可导入的交易记录');
     return;
   }
-  
-  let successCount = 0;
+
   let failCount = 0;
-  
   for (const trade of importPreviewData) {
-    try {
-      const success = await addTradeRecord({
-        symbol: trade.symbol,
-        name: trade.name,
-        type: trade.type,
-        shares: trade.shares,
-        price: trade.price,
-        commission: trade.commission,
-        trade_date: trade.trade_date
-      });
-      if (success) successCount++;
-      else failCount++;
-    } catch {
+    const shares = trade.shares;
+    const price = trade.price;
+    if (shares <= 0 || price <= 0 || !trade.symbol) {
       failCount++;
+      continue;
     }
+    const optMult = isOptionSymbol(trade.symbol) ? 100 : 1;
+    const total =
+      trade.total_amount > 0 ? trade.total_amount : shares * price * optMult;
+    const row: TradeRecord = {
+      id: crypto.randomUUID(),
+      symbol: trade.symbol.trim().toUpperCase(),
+      name: trade.name,
+      type: trade.type,
+      shares,
+      price,
+      total_amount: total,
+      commission: trade.commission ?? 0,
+      trade_date: trade.trade_date,
+      created_at: new Date().toISOString()
+    };
+    state.cash += cashDeltaForTrade(row);
+    state.trades.push(row);
   }
-  
-  // 重新加载数据
-  await loadTradesFiltered();
-  await loadPnlStatsOnStartup();
-  
+  sortTradesByDateDesc(state.trades);
+  flushPersistToLocal();
+  syncStocksFromTrades();
+  loadPnlStatsOnStartup();
+
+  const successCount = importPreviewData.length - failCount;
   closeImportTradeModal();
   render();
-  
+
   if (failCount === 0) {
     renderSuccess(`成功导入 ${successCount} 笔交易记录`);
   } else {
@@ -1555,288 +1569,45 @@ async function confirmImportTrades(): Promise<void> {
   }
 }
 
-// 加载盈亏统计
-async function loadPnlStats(options?: { startDate?: string; endDate?: string; symbol?: string }): Promise<PnlStats | null> {
-  if (!authToken) return null;
-  
-  const params = new URLSearchParams();
-  if (options?.startDate) params.append('startDate', options.startDate);
-  if (options?.endDate) params.append('endDate', options.endDate);
-  if (options?.symbol) params.append('symbol', options.symbol);
-  
-  try {
-    const res = await fetch(`/api/pnl?${params.toString()}`, {
-      headers: { 'Authorization': `Bearer ${authToken}` }
-    });
-    if (res.status === 401) {
-      return null;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json() as PnlStats;
-  } catch (e) {
-    console.error('加载盈亏统计失败:', e);
-    return null;
-  }
+function loadPnlStatsOnStartup(): void {
+  state.pnlStats = computeProfitLoss(state.trades, {
+    startDate: state.pnlStartDate || undefined,
+    endDate: state.pnlEndDate || undefined
+  });
 }
 
-// 加载盈亏统计（用于刷新）
-async function loadPnlStatsOnStartup(): Promise<void> {
-  const pnl = await loadPnlStats();
-  state.pnlStats = pnl;
+function setPnlQueryStartDate(value: string): void {
+  state.pnlStartDate = value;
 }
 
-// 启动时加载交易数据
-async function loadTradeDataOnStartup(): Promise<void> {
-  if (!authToken) return;
-  
-  const [trades, pnl] = await Promise.all([
-    loadTrades({ limit: '100' }),
-    loadPnlStats()
-  ]);
-  
-  state.trades = trades;
-  state.pnlStats = pnl;
+function setPnlQueryEndDate(value: string): void {
+  state.pnlEndDate = value;
 }
 
-// 登录
-async function submitLogin(email: string, password: string): Promise<boolean> {
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || '登录失败');
-    }
-    authToken = data.token;
-    sessionUsername = data.user.email;
-    localStorage.setItem('auth_token', authToken!);
-    await loadPortfolioOnStartup();
-    await loadTradeDataOnStartup();
-    return true;
-  } catch (e) {
-    console.error('登录失败:', e);
-    throw e;
-  }
-}
-
-// 注册
-async function submitRegister(email: string, password: string): Promise<boolean> {
-  try {
-    const res = await fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || '注册失败');
-    }
-    authToken = data.token;
-    sessionUsername = data.user.email;
-    localStorage.setItem('auth_token', authToken!);
-    await loadPortfolioOnStartup();
-    await loadTradeDataOnStartup();
-    return true;
-  } catch (e) {
-    console.error('注册失败:', e);
-    throw e;
-  }
-}
-
-// 登出
-function logout(): void {
-  authToken = null;
-  sessionUsername = null;
-  localStorage.removeItem('auth_token');
-  state.stocks = [];
-  state.cash = 0;
-  calculateTotals();
+/** 清空盈亏查询时间段，按全部交易日重算 */
+function resetPnlQuery(): void {
+  state.pnlStartDate = '';
+  state.pnlEndDate = '';
+  loadPnlStatsOnStartup();
   render();
 }
 
-// 恢复会话
-async function restoreSession(): Promise<void> {
-  const savedToken = localStorage.getItem('auth_token');
-  if (savedToken) {
-    authToken = savedToken;
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: savedToken }) // 简化：服务端验证 token
-      });
-      if (res.ok) {
-        const data = await res.json();
-        sessionUsername = data.user.email;
-        await loadPortfolioOnStartup();
-        return;
-      }
-    } catch {
-      // ignore
-    }
-    authToken = null;
-    localStorage.removeItem('auth_token');
-  }
-  sessionUsername = null;
-}
-
-// 全局函数供 HTML onclick 调用
-(window as unknown as Record<string, unknown>).submitLogin = async function() {
-  const email = (document.getElementById('auth-user') as HTMLInputElement)?.value;
-  const password = (document.getElementById('auth-pass') as HTMLInputElement)?.value;
-  const msgEl = document.getElementById('auth-msg');
-  if (!email || !password) {
-    if (msgEl) msgEl.textContent = '请填写邮箱和密码';
-    return;
-  }
-  try {
-    await submitLogin(email, password);
-    render();
-  } catch (e) {
-    if (msgEl) msgEl.textContent = (e as Error).message;
-  }
-};
-
-// 全局函数供 HTML onclick 调用
-(window as unknown as Record<string, unknown>).submitRegister = async function() {
-  const email = (document.getElementById('auth-user') as HTMLInputElement)?.value;
-  const password = (document.getElementById('auth-pass') as HTMLInputElement)?.value;
-  const msgEl = document.getElementById('auth-msg');
-  if (!email || !password) {
-    if (msgEl) msgEl.textContent = '请填写邮箱和密码';
-    return;
-  }
-  if (password.length < 6) {
-    if (msgEl) msgEl.textContent = '密码长度至少6位';
-    return;
-  }
-  try {
-    await submitRegister(email, password);
-    render();
-  } catch (e) {
-    if (msgEl) msgEl.textContent = (e as Error).message;
-  }
-};
-
-// 全局函数供 HTML onclick 调用
-(window as unknown as Record<string, unknown>).logout = logout;
-
-function renderAuthScreen(): string {
-  const tab = authPanelTab;
-  const loginForm = `
-    <form onsubmit="event.preventDefault(); submitLoginForm(); return false;">
-      <div class="input-group" style="margin-bottom:14px;">
-        <label for="auth-user">邮箱</label>
-        <input type="email" id="auth-user" autocomplete="email" required placeholder="your@email.com" />
-      </div>
-      <div class="input-group" style="margin-bottom:18px;">
-        <label for="auth-pass">密码</label>
-        <input type="password" id="auth-pass" autocomplete="current-password" required minlength="6" placeholder="至少6位" />
-      </div>
-      <button type="submit" class="btn btn-primary" style="width:100%;">登录</button>
-    </form>
-  `;
-  const registerForm = `
-    <form onsubmit="event.preventDefault(); submitRegisterForm(); return false;">
-      <div class="input-group" style="margin-bottom:14px;">
-        <label for="auth-user">邮箱</label>
-        <input type="email" id="auth-user" autocomplete="email" required placeholder="your@email.com" />
-      </div>
-      <div class="input-group" style="margin-bottom:18px;">
-        <label for="auth-pass">密码</label>
-        <input type="password" id="auth-pass" autocomplete="new-password" required minlength="6" placeholder="至少6位" />
-      </div>
-      <button type="submit" class="btn btn-primary" style="width:100%;">注册并登录</button>
-    </form>
-  `;
-  return `
-    <div class="container">
-      <div class="header">
-        <h1>美股持仓管理</h1>
-        <p>登录后持仓保存在服务器；不同账户数据隔离</p>
-      </div>
-      <div class="card" style="max-width: 440px; margin: 0 auto;">
-        <div style="display:flex; gap:10px; margin-bottom: 22px;">
-          <button type="button" class="btn ${tab === 'login' ? 'btn-primary' : 'btn-secondary'}" onclick="switchAuthTab('login')" style="flex:1;">登录</button>
-          <button type="button" class="btn ${tab === 'register' ? 'btn-primary' : 'btn-secondary'}" onclick="switchAuthTab('register')" style="flex:1;">注册</button>
-        </div>
-        ${tab === 'login' ? loginForm : registerForm}
-        <p id="auth-msg" style="margin-top:14px;font-size:0.9rem;min-height:1.3em;"></p>
-      </div>
-    </div>
-  `;
-}
-
-function switchAuthTab(tab: 'login' | 'register'): void {
-  authPanelTab = tab;
+// 刷新盈亏统计
+function refreshPnlStats(): void {
+  const sEl = document.getElementById('pnl-start-date') as HTMLInputElement | null;
+  const eEl = document.getElementById('pnl-end-date') as HTMLInputElement | null;
+  if (sEl) state.pnlStartDate = sEl.value;
+  if (eEl) state.pnlEndDate = eEl.value;
+  loadPnlStatsOnStartup();
   render();
 }
 
-// 表单提交包装函数（供 HTML 表单 onsubmit 调用）
-async function submitLoginForm(): Promise<void> {
-  const userEl = document.getElementById('auth-user') as HTMLInputElement | null;
-  const passEl = document.getElementById('auth-pass') as HTMLInputElement | null;
-  const msg = document.getElementById('auth-msg');
-  const u = userEl?.value?.trim() ?? '';
-  const p = passEl?.value ?? '';
-  if (!u || !p) {
-    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '请填写邮箱和密码'; }
-    return;
-  }
-  try {
-    await submitLogin(u, p);
-    if (msg) { msg.style.color = '#15803d'; msg.textContent = '登录成功！'; }
-    setTimeout(render, 500);
-  } catch (e) {
-    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = (e as Error).message; }
-  }
-}
-
-async function submitRegisterForm(): Promise<void> {
-  const userEl = document.getElementById('auth-user') as HTMLInputElement | null;
-  const passEl = document.getElementById('auth-pass') as HTMLInputElement | null;
-  const msg = document.getElementById('auth-msg');
-  const u = userEl?.value?.trim() ?? '';
-  const p = passEl?.value ?? '';
-  if (!u || !p) {
-    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '请填写邮箱和密码'; }
-    return;
-  }
-  if (p.length < 6) {
-    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = '密码至少6位'; }
-    return;
-  }
-  try {
-    await submitRegister(u, p);
-    if (msg) { msg.style.color = '#15803d'; msg.textContent = '注册成功！'; }
-    setTimeout(render, 500);
-  } catch (e) {
-    if (msg) { msg.style.color = '#b91c1c'; msg.textContent = (e as Error).message; }
-  }
-}
-
-async function logoutApp(): Promise<void> {
-  try {
-    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
-  } catch {
-    /* ignore */
-  }
-  sessionUsername = null;
-  state.stocks = [];
-  state.cash = 0;
-  calculateTotals();
-  render();
-}
-
-// 导出数据为 JSON 文件
 function exportToJSON(): void {
   const exportData: ExportData = {
-    version: '1.0',
+    version: '1.1',
     exportDate: new Date().toISOString(),
     cash: state.cash,
+    trades: state.trades,
     stocks: state.stocks.map(s => ({
       symbol: s.symbol,
       name: s.name,
@@ -1953,6 +1724,40 @@ function exportToCSV(): void {
   renderSuccess('数据已导出为 CSV 文件');
 }
 
+// 从备份 JSON 恢复交易记录
+function normalizeImportedTrades(arr: unknown[]): TradeRecord[] {
+  const out: TradeRecord[] = [];
+  for (const item of arr) {
+    if (!item || typeof item !== 'object') continue;
+    const o = item as Record<string, unknown>;
+    const id = String(o.id ?? crypto.randomUUID());
+    const symbol = String(o.symbol ?? '').trim().toUpperCase();
+    if (!symbol) continue;
+    const shares = Number(o.shares);
+    const price = Number(o.price);
+    if (!Number.isFinite(shares) || !Number.isFinite(price) || shares <= 0 || price <= 0) continue;
+    const typ = o.type === 'sell' || o.type === '卖出' ? 'sell' : 'buy';
+    const commission = Number.isFinite(Number(o.commission)) ? Number(o.commission) : 0;
+    const totalRaw = Number(o.total_amount);
+    out.push({
+      id,
+      symbol,
+      name: String(o.name ?? symbol),
+      type: typ,
+      shares,
+      price,
+      total_amount:
+        Number.isFinite(totalRaw) && totalRaw > 0
+          ? totalRaw
+          : shares * price * (isOptionSymbol(symbol) ? 100 : 1),
+      commission,
+      trade_date: String(o.trade_date ?? new Date().toISOString()),
+      created_at: String(o.created_at ?? new Date().toISOString())
+    });
+  }
+  return out;
+}
+
 // 从 JSON 文件导入
 function importFromJSON(event: Event): void {
   const input = event.target as HTMLInputElement;
@@ -1963,8 +1768,29 @@ function importFromJSON(event: Event): void {
   reader.onload = (e) => {
     try {
       const content = e.target?.result as string;
-      const data = JSON.parse(content) as ExportData;
+      const data = JSON.parse(content) as ExportData & { trades?: unknown[] };
       
+      if (Array.isArray(data.trades) && data.trades.length > 0) {
+        state.trades = normalizeImportedTrades(data.trades as unknown[]);
+        state.cash = typeof data.cash === 'number' && Number.isFinite(data.cash) ? data.cash : 0;
+        sortTradesByDateDesc(state.trades);
+        try {
+          localStorage.setItem(LS_TRADES_KEY, JSON.stringify(state.trades));
+        } catch (err) {
+          console.error(err);
+        }
+        syncStocksFromTrades();
+        saveToStorage();
+        loadPnlStatsOnStartup();
+        render();
+        void refreshFinnhubCanonicalEquivalents();
+        if (state.stocks.length > 0) {
+          setTimeout(() => updateStockPrices(), 500);
+        }
+        renderSuccess(`已导入 ${state.trades.length} 笔交易，持仓已同步`);
+        return;
+      }
+
       if (data.stocks && Array.isArray(data.stocks)) {
         state.stocks = data.stocks.map(s => {
           const sym = s.symbol.toUpperCase();
@@ -1973,7 +1799,6 @@ function importFromJSON(event: Event): void {
             ...s,
             symbol: sym,
             type: s.type ?? (isOptionSymbol(sym) ? 'option' : 'stock'),
-            // 期权：股数 × 现价 × 100
             position: s.shares * s.currentPrice * (opt ? 100 : 1),
             weight: 0
           };
@@ -1981,26 +1806,27 @@ function importFromJSON(event: Event): void {
         state.cash = data.cash || 0;
         calculateTotals();
         saveToStorage();
+        migratePortfolioStocksToTradesIfNeeded();
+        syncStocksFromTrades();
+        loadPnlStatsOnStartup();
         render();
 
         void refreshFinnhubCanonicalEquivalents();
 
-        // 如果有股票，自动更新价格
         if (state.stocks.length > 0) {
           setTimeout(() => updateStockPrices(), 500);
         }
 
-        renderSuccess(`成功导入 ${state.stocks.length} 条记录`);
+        renderSuccess(`成功导入持仓；已按需生成交易草稿并汇总`);
       } else {
         renderError('无效的数据格式');
       }
-    } catch (error) {
+    } catch {
       renderError('导入失败：文件格式错误');
     }
   };
   reader.readAsText(file);
 
-  // 清空 input 以允许再次选择同一文件
   input.value = '';
 }
 
@@ -2204,9 +2030,16 @@ function getGroupPortfolioPercent(
 // 渲染交易面板
 function renderTradePanel(): string {
   return `
+    <div class="trade-panel-block">
     <!-- 交易操作区域 -->
     <div style="margin-bottom: 20px;">
       <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+        <button type="button" class="btn btn-primary" onclick="openNewTradeForm('buy')" style="padding: 8px 16px; font-size: 0.85rem; background: #10b981; border: none; color: white;">
+          ＋ 新增买入
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="openNewTradeForm('sell')" style="padding: 8px 16px; font-size: 0.85rem; border: 1px solid #fecaca; color: #b91c1c; background: #fef2f2;">
+          ＋ 新增卖出
+        </button>
         <button class="btn btn-secondary" onclick="openTradeHistoryModal()" style="padding: 8px 16px; font-size: 0.85rem;">
           📋 交易记录 (${state.trades.length})
         </button>
@@ -2224,13 +2057,16 @@ function renderTradePanel(): string {
     <div style="margin-bottom: 20px; padding: 16px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;">
       <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px;">
         <span style="font-weight: 600; color: #334155;">查询盈亏:</span>
-        <input type="date" id="pnl-start-date" value="${state.pnlStartDate}" onchange="state.pnlStartDate = this.value"
+        <input type="date" id="pnl-start-date" value="${state.pnlStartDate}" onchange="setPnlQueryStartDate(this.value)"
                style="padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
         <span>至</span>
-        <input type="date" id="pnl-end-date" value="${state.pnlEndDate}" onchange="state.pnlEndDate = this.value"
+        <input type="date" id="pnl-end-date" value="${state.pnlEndDate}" onchange="setPnlQueryEndDate(this.value)"
                style="padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
         <button class="btn btn-secondary" onclick="refreshPnlStats()" style="padding: 6px 12px; font-size: 0.85rem;">
           查询
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="resetPnlQuery()" style="padding: 6px 12px; font-size: 0.85rem; color: #64748b;">
+          重置
         </button>
       </div>
       ${state.pnlStats ? `
@@ -2264,6 +2100,7 @@ function renderTradePanel(): string {
         <div style="color: #94a3b8; font-size: 0.85rem;">点击「查询」查看盈亏统计</div>
       `}
     </div>
+    </div>
   `;
 }
 
@@ -2271,7 +2108,6 @@ function renderTradePanel(): string {
 function openTradeHistoryModal(): void {
   tradeHistoryModalOpen = true;
   tradeHistoryPage = 1;
-  loadTradesFiltered();
   render();
 }
 
@@ -2281,16 +2117,8 @@ function closeTradeHistoryModal(): void {
   render();
 }
 
-// 加载筛选后的交易记录
-async function loadTradesFiltered(): Promise<void> {
-  const trades = await loadTrades({
-    symbol: tradeHistoryFilter.symbol || undefined,
-    startDate: tradeHistoryFilter.startDate || undefined,
-    endDate: tradeHistoryFilter.endDate || undefined,
-    limit: '1000' // 加载更多用于分页
-  });
-  // 直接替换，而不是追加
-  state.trades = trades;
+// 筛选（交易记录始终在本地 state.trades，此处仅重绘弹窗）
+function loadTradesFiltered(): void {
   render();
 }
 
@@ -2302,53 +2130,86 @@ function setTradeHistoryFilter(field: 'symbol' | 'type' | 'startDate' | 'endDate
     (tradeHistoryFilter as Record<string, string>)[field] = value;
   }
   tradeHistoryPage = 1;
-  void loadTradesFiltered();
+  if (field === 'symbol') {
+    patchTradeHistoryModalTableRoot();
+    return;
+  }
+  loadTradesFiltered();
 }
 
 // 重置筛选
 function resetTradeHistoryFilter(): void {
   tradeHistoryFilter = { symbol: '', type: '', startDate: '', endDate: '' };
   tradeHistoryPage = 1;
-  void loadTradesFiltered();
+  loadTradesFiltered();
 }
 
 // 切换分页
 function setTradeHistoryPage(page: number): void {
   tradeHistoryPage = page;
-  render();
+  patchTradeHistoryModalTableRootOrRender();
 }
 
-// 渲染交易历史弹窗
-function renderTradeHistoryModal(): string {
-  if (!tradeHistoryModalOpen) return '';
-  
-  // 筛选交易记录
+function setTradeHistoryPageSize(size: number): void {
+  if (!(TRADE_HISTORY_PAGE_SIZE_OPTIONS as readonly number[]).includes(size)) return;
+  tradeHistoryPageSize = size;
+  tradeHistoryPage = 1;
+  patchTradeHistoryModalTableRootOrRender();
+}
+
+function getTradeHistoryFilteredTrades(): TradeRecord[] {
   let filtered = [...state.trades];
   if (tradeHistoryFilter.symbol) {
-    filtered = filtered.filter(t => t.symbol.toUpperCase().includes(tradeHistoryFilter.symbol.toUpperCase()));
+    filtered = filtered.filter(t =>
+      t.symbol.toUpperCase().includes(tradeHistoryFilter.symbol.toUpperCase())
+    );
   }
   if (tradeHistoryFilter.type) {
     filtered = filtered.filter(t => t.type === tradeHistoryFilter.type);
   }
-  
-  // 分页计算
+  if (tradeHistoryFilter.startDate) {
+    filtered = filtered.filter(
+      (t) => t.trade_date.slice(0, 10) >= tradeHistoryFilter.startDate
+    );
+  }
+  if (tradeHistoryFilter.endDate) {
+    filtered = filtered.filter(
+      (t) => t.trade_date.slice(0, 10) <= tradeHistoryFilter.endDate
+    );
+  }
+  return filtered;
+}
+
+/** 交易记录弹窗内表格 + 分页（供 full render 与股票代码筛选时局部更新共用） */
+function buildTradeHistoryModalTableRootInnerHtml(): string {
+  const filtered = getTradeHistoryFilteredTrades();
   const total = filtered.length;
   const totalPages = Math.max(1, Math.ceil(total / tradeHistoryPageSize));
+  if (tradeHistoryPage > totalPages) {
+    tradeHistoryPage = totalPages;
+  }
   const startIdx = (tradeHistoryPage - 1) * tradeHistoryPageSize;
   const pageItems = filtered.slice(startIdx, startIdx + tradeHistoryPageSize);
-  
-  const rows = pageItems.length === 0 ? `
+
+  const rows =
+    pageItems.length === 0
+      ? `
     <tr>
       <td colspan="9" style="padding: 40px; text-align: center; color: #94a3b8;">
         暂无符合条件的交易记录
       </td>
     </tr>
-  ` : pageItems.map(trade => {
-    const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
-    const time = new Date(trade.trade_date).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-    const isBuy = trade.type === 'buy';
-    
-    return `
+  `
+      : pageItems
+          .map((trade) => {
+            const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
+            const time = new Date(trade.trade_date).toLocaleTimeString('zh-CN', {
+              hour: '2-digit',
+              minute: '2-digit'
+            });
+            const isBuy = trade.type === 'buy';
+
+            return `
       <tr style="border-bottom: 1px solid #e2e8f0;">
         <td style="padding: 12px; color: #64748b; font-size: 0.85rem;">${date}<br/><span style="font-size: 0.75rem;">${time}</span></td>
         <td style="padding: 12px;">
@@ -2380,9 +2241,9 @@ function renderTradeHistoryModal(): string {
         </td>
       </tr>
     `;
-  }).join('');
-  
-  // 分页导航
+          })
+          .join('');
+
   const pageNumbers = [];
   const maxPageButtons = 5;
   let startPage = Math.max(1, tradeHistoryPage - Math.floor(maxPageButtons / 2));
@@ -2390,37 +2251,107 @@ function renderTradeHistoryModal(): string {
   if (endPage - startPage < maxPageButtons - 1) {
     startPage = Math.max(1, endPage - maxPageButtons + 1);
   }
-  
+
   for (let i = startPage; i <= endPage; i++) {
     pageNumbers.push(i);
   }
-  
-  const paginationHtml = totalPages > 1 ? `
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
-      <span style="color: #64748b; font-size: 0.85rem;">共 ${total} 条记录</span>
-      <div style="display: flex; gap: 4px; align-items: center;">
+
+  const pageSizeSelectHtml = TRADE_HISTORY_PAGE_SIZE_OPTIONS.map(
+    (n) => `<option value="${n}"${tradeHistoryPageSize === n ? ' selected' : ''}>${n}</option>`
+  ).join('');
+
+  const pageNavHtml =
+    totalPages > 1
+      ? `
+      <div style="display: flex; gap: 4px; align-items: center; flex-wrap: wrap;">
         <button onclick="setTradeHistoryPage(${tradeHistoryPage - 1})" ${tradeHistoryPage === 1 ? 'disabled' : ''}
                 style="padding: 6px 12px; border: 1px solid #e2e8f0; background: white; border-radius: 4px; cursor: ${tradeHistoryPage === 1 ? 'not-allowed' : 'pointer'}; color: ${tradeHistoryPage === 1 ? '#cbd5e1' : '#334155'};">
           上一页
         </button>
-        ${pageNumbers.map(p => `
+        ${pageNumbers
+          .map(
+            (p) => `
           <button onclick="setTradeHistoryPage(${p})" 
                   style="padding: 6px 12px; border: 1px solid ${p === tradeHistoryPage ? '#667eea' : '#e2e8f0'}; background: ${p === tradeHistoryPage ? '#667eea' : 'white'}; color: ${p === tradeHistoryPage ? 'white' : '#334155'}; border-radius: 4px; cursor: pointer; font-weight: ${p === tradeHistoryPage ? '600' : '400'};">
             ${p}
           </button>
-        `).join('')}
+        `
+          )
+          .join('')}
         <button onclick="setTradeHistoryPage(${tradeHistoryPage + 1})" ${tradeHistoryPage === totalPages ? 'disabled' : ''}
                 style="padding: 6px 12px; border: 1px solid #e2e8f0; background: white; border-radius: 4px; cursor: ${tradeHistoryPage === totalPages ? 'not-allowed' : 'pointer'}; color: ${tradeHistoryPage === totalPages ? '#cbd5e1' : '#334155'};">
           下一页
         </button>
-      </div>
-    </div>
-  ` : `
-    <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; color: #64748b; font-size: 0.85rem;">
-      共 ${total} 条记录
-    </div>
-  `;
-  
+      </div>`
+      : '';
+
+  const tableSection = `
+        <div style="flex: 1; min-height: 0; overflow-y: auto; padding: 0 24px;">
+          <table style="width: 100%; border-collapse: collapse; min-width: 800px;">
+            <thead style="position: sticky; top: 0; background: white; z-index: 1;">
+              <tr style="border-bottom: 2px solid #e2e8f0;">
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">时间</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">类型</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">代码</th>
+                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">名称</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">股数</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">价格</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">金额</th>
+                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">手续费</th>
+                <th style="padding: 12px; text-align: center; font-size: 0.8rem; color: #64748b; font-weight: 600;">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+        </div>`;
+
+  const footerSection = `
+        <div style="flex-shrink: 0; padding: 12px 24px 16px; border-top: 1px solid #e2e8f0; background: #f8fafc;">
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;">
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+              <label style="color: #64748b; font-size: 0.85rem; white-space: nowrap;">每页条数</label>
+              <select onchange="setTradeHistoryPageSize(parseInt(this.value, 10))"
+                      style="padding: 6px 10px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; background: white; color: #334155;">
+                ${pageSizeSelectHtml}
+              </select>
+              <span style="color: #64748b; font-size: 0.85rem;">共 ${total} 条</span>
+            </div>
+            ${pageNavHtml}
+          </div>
+        </div>`;
+
+  return tableSection + footerSection;
+}
+
+function patchTradeHistoryModalTableRoot(): void {
+  if (!tradeHistoryModalOpen) return;
+  const root = document.getElementById('trade-history-modal-table-root');
+  if (!root) {
+    render();
+    return;
+  }
+  root.innerHTML = buildTradeHistoryModalTableRootInnerHtml();
+}
+
+function patchTradeHistoryModalTableRootOrRender(): void {
+  if (!tradeHistoryModalOpen) {
+    render();
+    return;
+  }
+  const root = document.getElementById('trade-history-modal-table-root');
+  if (!root) {
+    render();
+    return;
+  }
+  root.innerHTML = buildTradeHistoryModalTableRootInnerHtml();
+}
+
+// 渲染交易历史弹窗
+function renderTradeHistoryModal(): string {
+  if (!tradeHistoryModalOpen) return '';
+
   return `
     <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
       <div style="background: white; border-radius: 12px; width: 100%; max-width: 1000px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
@@ -2448,7 +2379,7 @@ function renderTradeHistoryModal(): string {
           <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
             <div>
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">股票代码</label>
-              <input type="text" value="${tradeHistoryFilter.symbol}" oninput="setTradeHistoryFilter('symbol', this.value)" placeholder="如：AAPL"
+              <input type="text" id="trade-history-symbol-filter" value="${escapeHtmlAttr(tradeHistoryFilter.symbol)}" oninput="setTradeHistoryFilter('symbol', this.value)" placeholder="如：AAPL"
                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; width: 120px;" />
             </div>
             <div>
@@ -2478,27 +2409,9 @@ function renderTradeHistoryModal(): string {
           </div>
         </div>
         
-        <!-- 表格区域 -->
-        <div style="flex: 1; overflow-y: auto; padding: 0 24px;">
-          <table style="width: 100%; border-collapse: collapse; min-width: 800px;">
-            <thead style="position: sticky; top: 0; background: white; z-index: 1;">
-              <tr style="border-bottom: 2px solid #e2e8f0;">
-                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">时间</th>
-                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">类型</th>
-                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">代码</th>
-                <th style="padding: 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600;">名称</th>
-                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">股数</th>
-                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">价格</th>
-                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">金额</th>
-                <th style="padding: 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600;">手续费</th>
-                <th style="padding: 12px; text-align: center; font-size: 0.8rem; color: #64748b; font-weight: 600;">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows}
-            </tbody>
-          </table>
-          ${paginationHtml}
+        <!-- 表格区域：中间滚动，底部分页条固定（股票代码筛选时仅替换本节点 innerHTML） -->
+        <div id="trade-history-modal-table-root" style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0;">
+          ${buildTradeHistoryModalTableRootInnerHtml()}
         </div>
       </div>
     </div>
@@ -2540,13 +2453,28 @@ function renderImportTradeModal(): string {
         <!-- 内容 -->
         <div style="padding: 24px; overflow-y: auto;">
           <!-- 文件选择 -->
-          <div style="margin-bottom: 20px;">
-            <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 500;">选择文件</label>
-            <input type="file" accept=".csv,.json" onchange="handleFileImport(event)"
+          <div style="margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid #e2e8f0;">
+            <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 600;">Moomoo 导入</label>
+            <input type="file" accept=".xlsx,.xls" onchange="handleMoomooTradeImport(event)"
                    style="width: 100%; padding: 12px; border: 2px dashed #cbd5e1; border-radius: 8px; background: #f8fafc;" />
-            <p style="margin-top: 8px; color: #64748b; font-size: 0.85rem;">
-              支持 CSV 和 JSON 格式。CSV 格式需包含：时间、类型、代码、名称、数量、价格、手续费（可选）列。
+            <p style="margin: 8px 0 0 0; color: #64748b; font-size: 0.82rem;">
+              上传 Moomoo（富途）导出的<strong>历史 / 现金账户 xlsx</strong>。仅导入「全部成交」：方向、代码、成交价格（或成交价）、成交金额、成交时间、合计费用；有「成交数量」则优先。
+              期权代码中行权价若为 ×1000 的长数字（如 …C40000→C40，…C5000→C5），会自动转为与本应用行情一致的紧凑码。
             </p>
+          </div>
+          <div style="margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid #e2e8f0;">
+            <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 600;">BBAE 导入</label>
+            <input type="file" accept=".xlsx,.xls" onchange="handleBbaeTradeImport(event)"
+                   style="width: 100%; padding: 12px; border: 2px dashed #cbd5e1; border-radius: 8px; background: #f8fafc;" />
+            <p style="margin: 8px 0 0 0; color: #64748b; font-size: 0.82rem;">
+              上传 BBAE 订单导出 xlsx（可多表）：<strong>股票</strong>表（已成、股票代码、成交价、成交数量、佣金…）；<strong>期权</strong>表的手续费为<strong>套餐外费用 + 期权监管费</strong>（不扣套餐抵扣）；仅有一列「套餐外费用加期权监管费减去套餐抵扣」时读取该格数值。
+            </p>
+          </div>
+          <div style="margin-bottom: 8px;">
+            <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 500;">本应用导出（可选）</label>
+            <input type="file" accept=".csv,.json" onchange="handleTradeBackupImport(event)"
+                   style="width: 100%; padding: 12px; border: 2px dashed #e2e8f0; border-radius: 8px; background: #fafafa;" />
+            <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 0.8rem;">使用此前在应用内「导出交易」生成的 CSV 或 JSON。</p>
           </div>
           
           <!-- 错误提示 -->
@@ -2600,7 +2528,8 @@ function renderImportTradeModal(): string {
 function renderEditTradeModal(): string {
   if (!editTradeModalOpen || !editingTrade) return '';
   
-  const tradeDate = editingTrade.trade_date.split('T')[0];
+  const tradeDtForInput = formatDatetimeLocalMinute(new Date(editingTrade.trade_date));
+  const editTradeDtMax = formatDatetimeLocalMinute(new Date());
   const isBuy = editingTrade.type === 'buy';
   
   return `
@@ -2642,8 +2571,8 @@ function renderEditTradeModal(): string {
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
           <div>
-            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易日期</label>
-            <input type="date" id="edit-trade-date" value="${tradeDate}" max="${new Date().toISOString().split('T')[0]}"
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易时间</label>
+            <input type="datetime-local" id="edit-trade-date" value="${tradeDtForInput}" max="${editTradeDtMax}" step="60"
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
         </div>
@@ -2672,22 +2601,39 @@ function renderEditTradeModal(): string {
 
 // 渲染交易表单
 function renderTradeForm(): string {
-  const today = new Date().toISOString().split('T')[0];
+  const tradeDtNow = formatDatetimeLocalMinute(new Date());
   const isBuy = tradeFormType === 'buy';
-  
-  return `
-    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-          <h3 style="margin: 0; color: #334155;">${isBuy ? '买入' : '卖出'} ${tradeFormSymbol}</h3>
-          <button onclick="closeTradeForm()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
-        </div>
-        
+  const symEsc = escapeHtml(tradeFormSymbol);
+  const nameEsc = escapeHtml(tradeFormName);
+
+  const headTitle = tradeFormFreeEntry
+    ? `${isBuy ? '买入' : '卖出'}（新建交易）`
+    : `${isBuy ? '买入' : '卖出'} ${symEsc}`;
+
+  const symbolBlock = tradeFormFreeEntry
+    ? `
+        <div class="input-group trade-form-symbol-search" style="position: relative; flex: 2; min-width: 200px; margin-bottom: 16px;">
+          <label for="trade-symbol-input">标的代码 *</label>
+          <input type="text" id="trade-symbol-input" value="${symEsc}" placeholder="股票 / 期权代码…"
+                 autocomplete="off" ${state.loading ? 'disabled' : ''} />
+          <div id="trade-stock-suggestions" class="suggestions-dropdown" style="display: none; z-index: 2000;"></div>
+        </div>`
+    : `
         <div style="margin-bottom: 16px;">
           <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股票名称</label>
-          <input type="text" value="${tradeFormName}" readonly
+          <input type="text" value="${nameEsc}" readonly
                  style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155;" />
+        </div>`;
+
+  return `
+    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); overflow: visible;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="margin: 0; color: #334155;">${headTitle}</h3>
+          <button onclick="closeTradeForm()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
         </div>
+
+        ${symbolBlock}
         
         <div style="display: flex; gap: 10px; margin-bottom: 16px;">
           <button onclick="setTradeType('buy')" 
@@ -2720,8 +2666,8 @@ function renderTradeForm(): string {
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
           <div>
-            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易日期</label>
-            <input type="date" id="trade-date" value="${today}" max="${today}"
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">交易时间</label>
+            <input type="datetime-local" id="trade-date" value="${tradeDtNow}" max="${tradeDtNow}" step="60"
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
         </div>
@@ -2839,7 +2785,6 @@ function renderHoldingsTableBody(): string {
           </td>`
               : `<td class="${holdingsCellClass('symbol')}" style="color: #94a3b8;">${HOLDINGS_DATA_MASK_HTML}</td>`
           }
-          <td class="${holdingsCellClass('name')}">${maskOr('name', escapeHtml(stock.name))}</td>
           <td class="${holdingsCellClass('shares')}" style="text-align: center; vertical-align: middle;">${maskOr('shares', sharesInner)}</td>
           <td class="${holdingsCellClass('cost')}" style="text-align: center; vertical-align: middle;">${maskOr('cost', costInner)}</td>
           ${
@@ -2894,8 +2839,6 @@ function renderHoldingsTableBody(): string {
               <button type="button" class="btn btn-sell holdings-action-btn" title="记录卖出" aria-label="记录卖出"
                       onclick="openTradeForm('${symEsc}', '${escapeHtml(stock.name).replace(/'/g, "\\'")}', 'sell')"
                       style="background: #ef4444; color: white; border: none;">卖</button>
-              <button type="button" class="btn btn-secondary holdings-action-btn" title="编辑成本" aria-label="编辑成本" onclick="openCostLotsEditor('${symEsc}')" style="padding: 4px 8px;">✎</button>
-              <button type="button" class="btn btn-danger holdings-action-btn" title="移除持仓" aria-label="移除持仓" onclick="removeStock('${symEsc}')">✕</button>
             </div>
           </td>`
               : `<td class="holdings-actions-cell ${holdingsCellClass('actions')}">${HOLDINGS_DATA_MASK_HTML}</td>`
@@ -2909,7 +2852,6 @@ function renderHoldingsTableBody(): string {
     <tr style="background: rgba(234, 179, 8, 0.12);">
       <td class="${holdingsCellClass('type')}">${maskOr('type', '<span style="background: #eab308; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">现金</span>')}</td>
       <td class="${holdingsCellClass('symbol')}" style="font-weight: 600; color: #a16207;">${maskOr('symbol', 'CASH')}</td>
-      <td class="${holdingsCellClass('name')}" style="color: #713f12;">${maskOr('name', '现金')}</td>
       <td class="${holdingsCellClass('shares')}" style="color: #94a3b8;">${maskOr('shares', '—')}</td>
       <td class="${holdingsCellClass('cost')}" style="color: #94a3b8;">${maskOr('cost', '—')}</td>
       <td class="${holdingsCellClass('price')}" style="color: #94a3b8;">${maskOr('price', '—')}</td>
@@ -3078,14 +3020,6 @@ async function addStock(): Promise<void> {
   }
 }
 
-// 函数：移除股票
-function removeStock(symbol: string): void {
-  state.stocks = state.stocks.filter(s => s.symbol !== symbol);
-  calculateTotals();
-  render();
-  renderSuccess(`已移除 ${symbol}`);
-}
-
 function setTableSort(key: TableSortKey): void {
   if (tableSortKey === key) {
     tableSortDir = tableSortDir === 1 ? -1 : 1;
@@ -3133,43 +3067,21 @@ function render(): void {
   const app = document.getElementById('app');
   if (!app) return;
 
-  if (!sessionUsername) {
-    app.innerHTML = renderAuthScreen();
-    return;
-  }
-
   app.innerHTML = `
     <div class="container">
-      <div class="header" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 16px; margin-bottom: 30px;">
-        <div style="text-align: center; flex: 1; min-width: 220px;">
+      <div class="header" style="text-align: center; margin-bottom: 30px;">
           <h1>美股持仓管理</h1>
-          <p>实时查询股票价格，计算持仓和仓位</p>
-        </div>
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="color: white; opacity: 0.92; font-size: 0.95rem;">${sessionUsername}</span>
-          <button type="button" class="btn btn-secondary" onclick="logoutApp()" style="padding: 8px 16px; font-size: 0.9rem;">退出</button>
-        </div>
+          <p>实时查询股票价格，计算持仓与仓位。持仓与交易记录保存在本机浏览器（localStorage）。</p>
       </div>
       
       <div class="card">
         <div class="input-section">
-          <div class="input-group" style="position: relative;">
-            <label for="symbol">股票代码</label>
-            <input type="text" id="symbol" placeholder="输入股票代码搜索..." autocomplete="off" ${state.loading ? 'disabled' : ''} />
+          <div class="input-group" style="position: relative; flex: 2; min-width: 200px;">
+            <label for="symbol">搜索代码（可选，预填「新增交易」）</label>
+            <input type="text" id="symbol" placeholder="股票 / 期权代码…" autocomplete="off" ${state.loading ? 'disabled' : ''} />
             <div id="stock-suggestions" class="suggestions-dropdown"></div>
           </div>
-          <div class="input-group">
-            <label for="shares">股数</label>
-            <input type="number" id="shares" placeholder="持有股数" step="0.01" min="0" ${state.loading ? 'disabled' : ''} />
-          </div>
-          <div class="input-group">
-            <label for="targetPrice">1年目标价</label>
-            <input type="number" id="targetPrice" placeholder="可选" step="0.01" min="0" ${state.loading ? 'disabled' : ''} />
-          </div>
-          <div class="input-actions">
-            <button class="btn btn-primary" onclick="addStock()" ${state.loading ? 'disabled' : ''}>
-              ${state.loading ? '<span class="loading"></span>' : '添加'}
-            </button>
+          <div class="input-actions" style="align-self: flex-end;">
             <button class="btn btn-secondary" onclick="updateStockPrices()" ${state.loading || state.stocks.length === 0 ? 'disabled' : ''}>
               ${state.loading ? '<span class="loading"></span>' : '刷新价格'}
             </button>
@@ -3202,13 +3114,13 @@ function render(): void {
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
             <h3>暂无持仓</h3>
-            <p>在上方输入股票代码或期权代码开始添加</p>
-            <p style="font-size: 0.85rem; color: #888; margin-top: 8px;">期权格式: AAPL250530C150</p>
+            <p>请点击上方「新增买入」记录首笔买入，持仓将按交易自动汇总（FIFO 成本）。</p>
+            <p style="font-size: 0.85rem; color: #888; margin-top: 8px;">期权格式示例: AAPL250530C150</p>
           </div>
         ` : `
           <div class="holdings-section-head" style="margin-bottom: 16px;">
             <h3 style="margin: 0;">持仓明细</h3>
-            <p class="holdings-hint" style="margin: 8px 0 0 0; font-size: 0.82rem; color: #64748b;">拖动「代码」列到另一条持仓，即可合并到同一标的；点击代码旁 ↺ 恢复自动分组。</p>
+            <p class="holdings-hint" style="margin: 8px 0 0 0; font-size: 0.82rem; color: #64748b;">持仓数据来自交易记录；股数与成本随买卖自动更新。可拖动「代码」合并分组。</p>
           </div>
           ${renderHoldingsColumnTogglePanel()}
           <div class="dashboard-summary-toggle-row">
@@ -3272,7 +3184,6 @@ function render(): void {
               <colgroup>
                 <col class="holdings-col-type" />
                 <col class="holdings-col-symbol" />
-                <col class="holdings-col-name" />
                 <col class="holdings-col-shares" />
                 <col class="holdings-col-cost" />
                 <col class="holdings-col-price" />
@@ -3291,7 +3202,6 @@ function render(): void {
                   <th class="${holdingsCellClass('symbol')}" style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('symbol')" title="按标的代码排序">
                     代码${tableSortKey === 'symbol' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}
                   </th>
-                  <th class="${holdingsCellClass('name')}">名称</th>
                   <th class="${holdingsCellClass('shares')}" title="多笔买入合计股数/张数，见「编辑」">股数</th>
                   <th class="${holdingsCellClass('cost')}" title="多笔买入的加权平均成本">成本</th>
                   <th class="${holdingsCellClass('price')}">现价</th>
@@ -3334,19 +3244,19 @@ function render(): void {
   
   // 每次渲染后重新设置下拉搜索事件
   setupStockSearchEvents();
+  setupTradeFormSymbolSearchEvents();
 }
 
-// 初始化应用（会话 → 持仓；未登录仅展示登录页）
+// 初始化应用（本地持久化）
 async function init(): Promise<void> {
-  await restoreSession();
-  if (sessionUsername) {
-    await loadPortfolioOnStartup();
-    await loadTradeDataOnStartup();
-  }
+  localStorage.removeItem('auth_token');
+  loadPersistedPortfolio();
+  loadPersistedTrades();
+  migratePortfolioStocksToTradesIfNeeded();
+  syncStocksFromTrades();
+  loadPnlStatsOnStartup();
   render();
-  if (sessionUsername) {
-    void refreshFinnhubCanonicalEquivalents();
-  }
+  void refreshFinnhubCanonicalEquivalents();
 }
 
 void init();
@@ -3370,24 +3280,27 @@ void init();
 (window as any).importFromJSON = importFromJSON;
 (window as any).importFromCSV = importFromCSV;
 (window as any).highlightSuggestion = highlightSuggestion;
+(window as any).highlightTradeFormSuggestion = highlightTradeFormSuggestion;
+(window as any).pickTradeFormSymbol = pickTradeFormSymbol;
 (window as any).openCostLotsEditor = openCostLotsEditor;
-(window as any).switchAuthTab = switchAuthTab;
-(window as any).submitLoginForm = submitLoginForm;
-(window as any).submitRegisterForm = submitRegisterForm;
-(window as any).logoutApp = logoutApp;
 (window as any).setHoldingsColumnVisible = setHoldingsColumnVisible;
 (window as any).setDashboardSummaryVisible = setDashboardSummaryVisible;
 (window as any).openTradeForm = openTradeForm;
+(window as any).openNewTradeForm = openNewTradeForm;
 (window as any).closeTradeForm = closeTradeForm;
 (window as any).setTradeType = setTradeType;
 (window as any).submitTrade = submitTrade;
 (window as any).handleDeleteTrade = handleDeleteTrade;
 (window as any).refreshPnlStats = refreshPnlStats;
+(window as any).setPnlQueryStartDate = setPnlQueryStartDate;
+(window as any).setPnlQueryEndDate = setPnlQueryEndDate;
+(window as any).resetPnlQuery = resetPnlQuery;
 (window as any).openTradeHistoryModal = openTradeHistoryModal;
 (window as any).closeTradeHistoryModal = closeTradeHistoryModal;
 (window as any).setTradeHistoryFilter = setTradeHistoryFilter;
 (window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
 (window as any).setTradeHistoryPage = setTradeHistoryPage;
+(window as any).setTradeHistoryPageSize = setTradeHistoryPageSize;
 (window as any).openEditTradeModal = openEditTradeModal;
 (window as any).closeEditTradeModal = closeEditTradeModal;
 (window as any).submitEditTrade = submitEditTrade;
@@ -3395,7 +3308,9 @@ void init();
 (window as any).exportTradesToJSON = exportTradesToJSON;
 (window as any).openImportTradeModal = openImportTradeModal;
 (window as any).closeImportTradeModal = closeImportTradeModal;
-(window as any).handleFileImport = handleFileImport;
+(window as any).handleMoomooTradeImport = handleMoomooTradeImport;
+(window as any).handleBbaeTradeImport = handleBbaeTradeImport;
+(window as any).handleTradeBackupImport = handleTradeBackupImport;
 (window as any).confirmImportTrades = confirmImportTrades;
 
 // 下拉搜索相关变量
@@ -3403,6 +3318,13 @@ let selectedIndex = -1;
 /** 与当前下拉内容一致，供键盘上下键/回车使用（含 Finnhub 合并结果） */
 let lastSearchSuggestions: SuggestionItem[] = [];
 let searchDebounceId: ReturnType<typeof setTimeout> | null = null;
+
+/** 新建交易弹窗内标的代码搜索（与顶栏搜索同逻辑，独立下拉避免与 #symbol 冲突） */
+let tradeFormSearchDebounceId: ReturnType<typeof setTimeout> | null = null;
+let lastTradeFormSearchSuggestions: SuggestionItem[] = [];
+let tradeFormSuggestionSelectedIndex = -1;
+/** 每次输入或选中一项后递增，用于丢弃已失效的异步搜索结果，避免选中后下拉又被打开 */
+let tradeFormSymbolSearchSeq = 0;
 
 // 函数：过滤股票
 interface SuggestionItem {
@@ -3422,7 +3344,7 @@ function filterOptionPattern(query: string): SuggestionItem[] {
   const upperQuery = query.toUpperCase().trim();
   const results: SuggestionItem[] = [];
 
-  const optionMatch = upperQuery.match(/^([A-Z]{1,5})(\d{6})([CP])(\d+)$/);
+  const optionMatch = upperQuery.match(/^([A-Z]{1,5})(\d{6})([CP])(\d+(?:\.\d+)?)$/);
   if (optionMatch) {
     const [, symbol, expiry, type, strike] = optionMatch;
     const underlyingName = getStockDisplayName(symbol);
@@ -3542,13 +3464,65 @@ function hideSuggestions(): void {
   selectedIndex = -1;
 }
 
+function hideTradeFormSuggestions(): void {
+  const dropdown = document.getElementById('trade-stock-suggestions');
+  if (dropdown) {
+    dropdown.style.display = 'none';
+  }
+  tradeFormSuggestionSelectedIndex = -1;
+}
+
+function showTradeFormSuggestions(suggestions: SuggestionItem[]): void {
+  const dropdown = document.getElementById('trade-stock-suggestions');
+  if (!dropdown) return;
+
+  lastTradeFormSearchSuggestions = suggestions;
+
+  if (suggestions.length === 0) {
+    dropdown.innerHTML =
+      '<div class="no-results">输入股票代码或期权代码搜索<br><small style="color:#999">期权格式: AAPL250530C150</small></div>';
+    dropdown.style.display = 'block';
+    return;
+  }
+
+  dropdown.innerHTML = suggestions
+    .map((item, index) => {
+      const isOpt = item.optionStrike !== undefined;
+      const handler = `pickTradeFormSymbol(${JSON.stringify(item.symbol)})`;
+      return `
+    <div class="suggestion-item ${index === tradeFormSuggestionSelectedIndex ? 'selected' : ''} ${isOpt ? 'option-item' : ''}"
+         onclick="${escapeHtmlAttr(handler)}"
+         onmouseenter="highlightTradeFormSuggestion(${index})">
+      <span class="suggestion-symbol">${escapeHtml(item.symbol)}</span>
+      <span class="suggestion-name">${escapeHtml(item.name)}</span>
+      ${isOpt ? '<span class="option-badge">期权</span>' : ''}
+    </div>`;
+    })
+    .join('');
+
+  dropdown.style.display = 'block';
+  tradeFormSuggestionSelectedIndex = -1;
+}
+
 // 函数：高亮建议项
 function highlightSuggestion(index: number): void {
-  const items = document.querySelectorAll('.suggestion-item');
+  const dropdown = document.getElementById('stock-suggestions');
+  if (!dropdown) return;
+  const items = dropdown.querySelectorAll('.suggestion-item');
   items.forEach((item, i) => {
     (item as HTMLElement).classList.toggle('selected', i === index);
   });
   selectedIndex = index;
+}
+
+function highlightTradeFormSuggestion(index: number): void {
+  const dropdown = document.getElementById('trade-stock-suggestions');
+  if (!dropdown) return;
+  const items = dropdown.querySelectorAll('.suggestion-item');
+  items.forEach((item, i) => {
+    (item as HTMLElement).classList.toggle('selected', i === index);
+  });
+  tradeFormSuggestionSelectedIndex = index;
 }
 
 // 函数：选择股票
@@ -3602,11 +3576,24 @@ function selectStock(
   }
 
   hideSuggestions();
+}
 
-  const sharesInput = document.getElementById('shares') as HTMLInputElement;
-  if (sharesInput) {
-    sharesInput.focus();
+/** 新建交易：从下拉选中标的，仅写入代码；名称在保存时用代码填充 */
+function pickTradeFormSymbol(symbol: string): void {
+  if (tradeFormSearchDebounceId !== null) {
+    clearTimeout(tradeFormSearchDebounceId);
+    tradeFormSearchDebounceId = null;
   }
+  tradeFormSymbolSearchSeq++;
+  lastTradeFormSearchSuggestions = [];
+  tradeFormSuggestionSelectedIndex = -1;
+
+  const sym = symbol.trim().toUpperCase();
+  tradeFormSymbol = sym;
+  tradeFormName = '';
+  const symIn = document.getElementById('trade-symbol-input') as HTMLInputElement | null;
+  if (symIn) symIn.value = sym;
+  hideTradeFormSuggestions();
 }
 
 // 更新期权信息显示
@@ -3708,6 +3695,74 @@ function setupStockSearchEvents(): void {
     const target = e.target as HTMLElement;
     if (!target.closest('.input-group')) {
       hideSuggestions();
+      hideTradeFormSuggestions();
+    }
+  });
+}
+
+function setupTradeFormSymbolSearchEvents(): void {
+  const input = document.getElementById('trade-symbol-input') as HTMLInputElement | null;
+  const dropdown = document.getElementById('trade-stock-suggestions');
+  if (!input || !dropdown) return;
+
+  const scheduleMerge = (value: string): void => {
+    if (tradeFormSearchDebounceId) clearTimeout(tradeFormSearchDebounceId);
+    tradeFormSymbolSearchSeq++;
+    const requestSeq = tradeFormSymbolSearchSeq;
+    const localPreview = filterOptionPattern(value);
+    if (localPreview.length === 0 && value.trim().length >= 2) {
+      lastTradeFormSearchSuggestions = [];
+      dropdown.innerHTML = '<div class="no-results" style="color:#666">正在搜索…</div>';
+      dropdown.style.display = 'block';
+    } else {
+      lastTradeFormSearchSuggestions = localPreview;
+      showTradeFormSuggestions(localPreview);
+    }
+    tradeFormSearchDebounceId = setTimeout(() => {
+      tradeFormSearchDebounceId = null;
+      void (async () => {
+        const suggestions = await buildSearchSuggestions(value);
+        if (requestSeq !== tradeFormSymbolSearchSeq) return;
+        if (input.value !== value) return;
+        lastTradeFormSearchSuggestions = suggestions;
+        showTradeFormSuggestions(suggestions);
+      })();
+    }, 280);
+  };
+
+  input.addEventListener('input', (e) => {
+    const value = (e.target as HTMLInputElement).value;
+    scheduleMerge(value);
+  });
+
+  input.addEventListener('focus', () => {
+    const value = input.value;
+    if (value) scheduleMerge(value);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    const suggestions = lastTradeFormSearchSuggestions;
+    if (e.key === 'Escape') {
+      hideTradeFormSuggestions();
+      return;
+    }
+    if (suggestions.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      tradeFormSuggestionSelectedIndex = Math.min(
+        tradeFormSuggestionSelectedIndex + 1,
+        suggestions.length - 1
+      );
+      highlightTradeFormSuggestion(tradeFormSuggestionSelectedIndex);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      tradeFormSuggestionSelectedIndex = Math.max(tradeFormSuggestionSelectedIndex - 1, 0);
+      highlightTradeFormSuggestion(tradeFormSuggestionSelectedIndex);
+    } else if (e.key === 'Enter' && tradeFormSuggestionSelectedIndex >= 0) {
+      e.preventDefault();
+      const item = suggestions[tradeFormSuggestionSelectedIndex];
+      pickTradeFormSymbol(item.symbol);
     }
   });
 }

@@ -4,7 +4,7 @@
 
 - **核心**: Vite 7, TypeScript, Express
 - **UI**: Tailwind CSS
-- **数据库**: Supabase
+- **数据**: 浏览器 localStorage（持仓 `stockPortfolio`、交易 `stockTrades`）；服务端仅代理行情 API
 - **Node.js**: 24
 
 ## 目录结构
@@ -93,42 +93,23 @@ bash scripts/start.sh
 - 生产入口：`node dist-server/server.js`
 - 端口固定为 `5000`
 
-### 数据库持久化
+### 数据持久化与 API
 
-交易记录使用 Supabase PostgreSQL 存储：
+**浏览器（localStorage）：**
+- `stockPortfolio` — 持仓与现金（JSON）
+- `stockTrades` — 交易记录数组（JSON）
 
-**表结构：**
-- `trades` - 交易记录表（id, user_id, symbol, name, type, shares, price, total_amount, commission, trade_date, created_at）
+**客户端逻辑：**
+- `src/main.ts` — 界面与写入 localStorage
+- `src/localTrades.ts` — FIFO 盈亏与区间汇总（与原先服务端口径一致）
 
-**客户端：**
-- `server/storage/database/supabase-client.ts` - Supabase 客户端
-- `server/storage/database/portfolioStore.ts` - 交易与持仓操作
+**服务端行情（`server/routes/stocks.ts`，挂载在 `/api`）：**
+- `GET /api/stock/:symbol` — Finnhub 报价
+- `GET /api/option/:symbol` — Polygon 期权
+- `GET /api/search` — Finnhub Symbol Search
+- `GET /api/symbol/canonical-underlying/:symbol` — ETF 主成分推断
+- `GET /api/options/chain/:underlying` — 期权链（可选）
 
-**API 接口：**
-- `POST /api/trades` - 添加交易（买入/卖出）
-- `GET /api/trades` - 获取交易历史（支持 symbol, startDate, endDate, limit 参数）
-- `PUT /api/trades/:id` - 编辑交易记录
-- `GET /api/positions` - 获取当前持仓（基于交易记录计算）
-- `GET /api/pnl` - 获取盈亏统计（支持时间范围和股票筛选）
-- `DELETE /api/trades/:id` - 删除交易记录
+**环境变量（可选）：** `FINNHUB_API_KEY`、`POLYGON_API_KEY`
 
-**盈亏计算：**
-- 使用 FIFO（先进先出）法计算已实现盈亏
-- 支持时间段查询历史盈亏
-- 按股票或全部汇总
-
-**前端交易功能：**
-- 表格操作列提供「买」「卖」按钮
-- 交易表单弹窗：填写股数、价格、手续费、交易日期
-- 交易记录弹窗：点击「交易记录」按钮打开，支持筛选和分页
-- 盈亏统计面板支持按时间段查询
-
-**交易记录弹窗功能：**
-- 支持按股票代码筛选
-- 支持按交易类型筛选（买入/卖出）
-- 支持按日期范围筛选
-- 分页显示（每页10条）
-- 可编辑和删除单条交易记录
-- 支持导入（CSV/JSON）和导出（CSV/JSON）
-
-**注意：** Session（登录状态）仍存储在内存中，服务重启后需重新登录。
+**前端交易功能：** 买/卖记录、交易记录弹窗（筛选、分页、导入导出）、盈亏面板按时间段查询；无登录，数据仅存本机。

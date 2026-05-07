@@ -2,11 +2,9 @@ import { Router } from 'express';
 
 const router = Router();
 
-// Finnhub API Key (股票数据)
-const FINNHUB_API_KEY = 'd7sa5a1r01qorsvhvrlgd7sa5a1r01qorsvhvrm0';
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || 'd7sa5a1r01qorsvhvrlgd7sa5a1r01qorsvhvrm0';
 
-// Polygon.io API Key (期权数据)
-const POLYGON_API_KEY = 'ksTLCk4yRwmpfGycHMVKdvYIWyoAuCsb';
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY || 'ksTLCk4yRwmpfGycHMVKdvYIWyoAuCsb';
 
 // 股票数据接口
 interface StockData {
@@ -33,7 +31,7 @@ interface OptionData {
 // 解析期权代码
 function parseOptionSymbol(symbol: string): { underlying: string; expiration: string; type: string; strike: string } | null {
   // 格式: AAPL250530C150 或 AAPL260620P200
-  const match = symbol.match(/^([A-Z]+)(\d{6})([CP])(\d+)$/i);
+  const match = symbol.match(/^([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)$/i);
   if (!match) return null;
   
   const [, underlying, date, type, strike] = match;
@@ -196,8 +194,9 @@ router.get('/options/chain/:underlying', async (req, res) => {
     }
     
     // 返回期权列表
-    const options = data.results.map((contract: any) => ({
-      ticker: contract.ticker.replace('O:', ''),
+    const results = Array.isArray(data.results) ? data.results : [];
+    const options = results.map((contract: Record<string, unknown>) => ({
+      ticker: String(contract.ticker ?? '').replace(/^O:/, ''),
       type: contract.contract_type,
       strikePrice: contract.strike_price,
       expirationDate: contract.expiration_date,
