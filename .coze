@@ -3,6 +3,7 @@ sub_id = "0527ad55"
 name = "projects"
 requires = [ "nodejs-24" ]
 project_type = "web"
+entrypoint = "dist-server/server.js"
 
 [preview]
 preview_enable = "enabled"
