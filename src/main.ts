@@ -152,6 +152,11 @@ let tradeHistoryPageSize = 10;
 const TRADE_HISTORY_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 /** 交易记录弹窗：明细列表 / 标的盈亏汇总 */
 let tradeHistoryModalTab: 'list' | 'summary' = 'list';
+/** 盈亏汇总表格排序 */
+type TradeHistorySymbolPnlSortKey = 'symbol' | 'totalBuy' | 'totalSell' | 'netPnl';
+let tradeHistorySymbolPnlSortKey: TradeHistorySymbolPnlSortKey = 'symbol';
+/** 1 升序，-1 降序（代码 A→Z / 金额小→大 为升序） */
+let tradeHistorySymbolPnlSortDir: 1 | -1 = 1;
 
 /** 盈亏累计可视化：折线 / 收益日历 */
 let pnlVizMode: 'line' | 'calendar' = 'line';
@@ -3512,6 +3517,16 @@ function setTradeHistoryModalTab(tab: 'list' | 'summary'): void {
   render();
 }
 
+function setTradeHistorySymbolPnlSort(key: TradeHistorySymbolPnlSortKey): void {
+  if (tradeHistorySymbolPnlSortKey === key) {
+    tradeHistorySymbolPnlSortDir = tradeHistorySymbolPnlSortDir === 1 ? -1 : 1;
+  } else {
+    tradeHistorySymbolPnlSortKey = key;
+    tradeHistorySymbolPnlSortDir = 1;
+  }
+  patchTradeHistoryModalTableRootOrRender();
+}
+
 // 关闭交易记录弹窗
 function closeTradeHistoryModal(): void {
   tradeHistoryModalOpen = false;
@@ -3637,7 +3652,30 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
   if (tradeHistoryFilter.startDate) rangeOpts.startDate = tradeHistoryFilter.startDate;
   if (tradeHistoryFilter.endDate) rangeOpts.endDate = tradeHistoryFilter.endDate;
 
-  const rows = computeSymbolTradePnlSummaries(state.trades, rangeOpts);
+  const rowsRaw = computeSymbolTradePnlSummaries(state.trades, rangeOpts);
+  const dir = tradeHistorySymbolPnlSortDir;
+  const key = tradeHistorySymbolPnlSortKey;
+  const rows = [...rowsRaw].sort((a, b) => {
+    let cmp = 0;
+    switch (key) {
+      case 'symbol':
+        cmp = a.symbol.localeCompare(b.symbol);
+        break;
+      case 'totalBuy':
+        cmp = a.totalBuyAmount - b.totalBuyAmount;
+        break;
+      case 'totalSell':
+        cmp = a.totalSellAmount - b.totalSellAmount;
+        break;
+      case 'netPnl':
+        cmp = a.netPnl - b.netPnl;
+        break;
+      default:
+        cmp = 0;
+    }
+    if (cmp !== 0) return cmp * dir;
+    return a.symbol.localeCompare(b.symbol);
+  });
 
   let sumBuy = 0;
   let sumSell = 0;
@@ -3713,6 +3751,12 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
 
   const metaLine = `${escapeHtml(rangeLabel)} · 合计 ${rows.length} 个标的 · FIFO 与累计日历一致（区间内卖出的数量可匹配区间前先入队的买入）`;
 
+  const sortMark = (k: TradeHistorySymbolPnlSortKey): string =>
+    tradeHistorySymbolPnlSortKey === k ? (tradeHistorySymbolPnlSortDir === 1 ? ' ▲' : ' ▼') : '';
+
+  const thSortable = (k: TradeHistorySymbolPnlSortKey, label: string, extraTitle = '') =>
+    `<th style="padding: 10px 12px; text-align: ${k === 'symbol' ? 'left' : 'right'}; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff; cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTradeHistorySymbolPnlSort('${k}')" title="点击排序${extraTitle ? ` · ${extraTitle}` : ''}">${label}${sortMark(k)}</th>`;
+
   const tableSection = `
         <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">
           <p style="flex-shrink: 0; margin: 0; padding: 16px 24px 12px; color: #64748b; font-size: 0.8rem;">${metaLine}</p>
@@ -3720,11 +3764,11 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
           <table style="width: 100%; border-collapse: separate; border-spacing: 0; min-width: 680px;">
             <thead style="position: sticky; top: 0; z-index: 2; background: #ffffff;">
               <tr style="box-shadow: inset 0 -2px 0 #e2e8f0;">
-                <th style="padding: 10px 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">代码</th>
-                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总买入金额</th>
-                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总卖出金额</th>
+                ${thSortable('symbol', '代码')}
+                ${thSortable('totalBuy', '总买入金额')}
+                ${thSortable('totalSell', '总卖出金额')}
                 <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总费用</th>
-                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;" title="FIFO 已实现盈亏 − 本标的买卖手续费">盈亏金额</th>
+                ${thSortable('netPnl', '盈亏金额', 'FIFO 已实现 − 本标的买卖手续费')}
               </tr>
             </thead>
             <tbody>
@@ -5132,6 +5176,7 @@ void init();
 (window as any).openTradeHistoryModalForCalendarMonth = openTradeHistoryModalForCalendarMonth;
 (window as any).closeTradeHistoryModal = closeTradeHistoryModal;
 (window as any).setTradeHistoryModalTab = setTradeHistoryModalTab;
+(window as any).setTradeHistorySymbolPnlSort = setTradeHistorySymbolPnlSort;
 (window as any).setTradeHistoryFilter = setTradeHistoryFilter;
 (window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
 (window as any).setTradeHistoryPage = setTradeHistoryPage;
