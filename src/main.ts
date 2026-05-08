@@ -2,6 +2,7 @@
 import {
   buildDailyCumulativeNetPnlSeries,
   computeProfitLoss,
+  computeSymbolTradePnlSummaries,
   deriveHoldingsFromTrades,
   expandCumulativeDailyToAllDays
 } from './localTrades';
@@ -149,6 +150,8 @@ let tradeHistoryPage = 1;
 /** 交易记录弹窗每页条数（可选 10 / 20 / 50 / 100） */
 let tradeHistoryPageSize = 10;
 const TRADE_HISTORY_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
+/** 交易记录弹窗：明细列表 / 标的盈亏汇总 */
+let tradeHistoryModalTab: 'list' | 'summary' = 'list';
 
 /** 盈亏累计可视化：折线 / 收益日历 */
 let pnlVizMode: 'line' | 'calendar' = 'line';
@@ -3459,6 +3462,7 @@ function renderTradePanel(): string {
 // 打开交易记录弹窗
 function openTradeHistoryModal(): void {
   tradeHistoryModalOpen = true;
+  tradeHistoryModalTab = 'list';
   tradeHistoryPage = 1;
   render();
 }
@@ -3468,6 +3472,7 @@ function openTradeHistoryModalForSymbol(symbol: string): void {
   const s = symbol.trim();
   if (!s) return;
   tradeHistoryModalOpen = true;
+  tradeHistoryModalTab = 'list';
   tradeHistoryFilter = { symbol: s, type: '', otherCategory: '', startDate: '', endDate: '' };
   tradeHistoryPage = 1;
   render();
@@ -3478,6 +3483,7 @@ function openTradeHistoryModalForCalendarDay(isoDate: string): void {
   const d = isoDate.trim().slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
   tradeHistoryModalOpen = true;
+  tradeHistoryModalTab = 'list';
   tradeHistoryFilter = { symbol: '', type: '', otherCategory: '', startDate: d, endDate: d };
   tradeHistoryPage = 1;
   render();
@@ -3492,8 +3498,17 @@ function openTradeHistoryModalForCalendarMonth(y: number, mo: number): void {
   const start = ymKey(yi, moi, 1);
   const end = ymKey(yi, moi, dim);
   tradeHistoryModalOpen = true;
+  tradeHistoryModalTab = 'list';
   tradeHistoryFilter = { symbol: '', type: '', otherCategory: '', startDate: start, endDate: end };
   tradeHistoryPage = 1;
+  render();
+}
+
+function setTradeHistoryModalTab(tab: 'list' | 'summary'): void {
+  tradeHistoryModalTab = tab;
+  if (tab === 'list') {
+    tradeHistoryPage = 1;
+  }
   render();
 }
 
@@ -3616,8 +3631,123 @@ function getTradeHistoryFilteredTrades(): TradeRecord[] {
   return filtered;
 }
 
+/** 交易记录弹窗 · 盈亏汇总表（按标的 FIFO，盈亏 = 已实现毛额 − 本标的买卖手续费） */
+function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
+  const rangeOpts: { startDate?: string; endDate?: string } = {};
+  if (tradeHistoryFilter.startDate) rangeOpts.startDate = tradeHistoryFilter.startDate;
+  if (tradeHistoryFilter.endDate) rangeOpts.endDate = tradeHistoryFilter.endDate;
+
+  const rows = computeSymbolTradePnlSummaries(state.trades, rangeOpts);
+
+  let sumBuy = 0;
+  let sumSell = 0;
+  let sumComm = 0;
+  let sumNet = 0;
+  for (const r of rows) {
+    sumBuy += r.totalBuyAmount;
+    sumSell += r.totalSellAmount;
+    sumComm += r.totalCommission;
+    sumNet += r.netPnl;
+  }
+
+  const rangeLabel =
+    tradeHistoryFilter.startDate && tradeHistoryFilter.endDate
+      ? `${tradeHistoryFilter.startDate} ~ ${tradeHistoryFilter.endDate}`
+      : tradeHistoryFilter.startDate
+        ? `${tradeHistoryFilter.startDate} 起`
+        : tradeHistoryFilter.endDate
+          ? `至 ${tradeHistoryFilter.endDate}`
+          : '全部时间';
+
+  const bodyRows =
+    rows.length === 0
+      ? `
+    <tr>
+      <td colspan="5" style="padding: 40px; text-align: center; color: #94a3b8;">
+        暂无买卖记录
+      </td>
+    </tr>
+  `
+      : rows
+          .map((r) => {
+            const netColor = r.netPnl >= 0 ? '#10b981' : '#ef4444';
+            const netSign = r.netPnl >= 0 ? '+' : '-';
+            const symArg = JSON.stringify(r.symbol);
+            return `
+      <tr style="border-bottom: 1px solid #e2e8f0;">
+        <td style="padding: 12px;">
+          <button type="button" onclick="openTradeHistoryModalForSymbol(${symArg})"
+                  style="padding: 0; border: none; background: none; font-weight: 600; color: #667eea; cursor: pointer; font-size: 0.9rem;">
+            ${escapeHtml(r.symbol)}
+          </button>
+        </td>
+        <td style="padding: 12px; text-align: right; font-weight: 500; color: #334155;">$${formatNumber(r.totalBuyAmount)}</td>
+        <td style="padding: 12px; text-align: right; font-weight: 500; color: #334155;">$${formatNumber(r.totalSellAmount)}</td>
+        <td style="padding: 12px; text-align: right; color: #ef4444; font-size: 0.85rem;">
+          ${r.totalCommission > 0 ? `-$${formatNumber(r.totalCommission)}` : '—'}
+        </td>
+        <td style="padding: 12px; text-align: right; font-weight: 600; color: ${netColor};">
+          ${netSign}$${formatNumber(Math.abs(r.netPnl))}
+        </td>
+      </tr>
+    `;
+          })
+          .join('');
+
+  const totalRow =
+    rows.length === 0
+      ? ''
+      : `
+      <tr style="border-top: 2px solid #cbd5e1; background: #f8fafc; font-weight: 600;">
+        <td style="padding: 12px;">合计</td>
+        <td style="padding: 12px; text-align: right;">$${formatNumber(sumBuy)}</td>
+        <td style="padding: 12px; text-align: right;">$${formatNumber(sumSell)}</td>
+        <td style="padding: 12px; text-align: right; color: #ef4444;">
+          ${sumComm > 0 ? `-$${formatNumber(sumComm)}` : '—'}
+        </td>
+        <td style="padding: 12px; text-align: right; color: ${sumNet >= 0 ? '#10b981' : '#ef4444'};">
+          ${sumNet >= 0 ? '+' : '-'}$${formatNumber(Math.abs(sumNet))}
+        </td>
+      </tr>
+    `;
+
+  const metaLine = `${escapeHtml(rangeLabel)} · 合计 ${rows.length} 个标的（含期权合约代码则按 FIFO×100 与盈亏面板一致）`;
+
+  const tableSection = `
+        <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">
+          <p style="flex-shrink: 0; margin: 0; padding: 16px 24px 12px; color: #64748b; font-size: 0.8rem;">${metaLine}</p>
+          <div style="flex: 1; min-height: 0; overflow-y: auto; padding: 0 24px 8px;">
+          <table style="width: 100%; border-collapse: separate; border-spacing: 0; min-width: 680px;">
+            <thead style="position: sticky; top: 0; z-index: 2; background: #ffffff;">
+              <tr style="box-shadow: inset 0 -2px 0 #e2e8f0;">
+                <th style="padding: 10px 12px; text-align: left; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">代码</th>
+                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总买入金额</th>
+                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总卖出金额</th>
+                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总费用</th>
+                <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;" title="FIFO 已实现盈亏 − 本标的买卖手续费">盈亏金额</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${bodyRows}
+              ${totalRow}
+            </tbody>
+          </table>
+          </div>
+        </div>`;
+
+  const footerSection = `
+        <div style="flex-shrink: 0; padding: 12px 24px 16px; border-top: 1px solid #e2e8f0; background: #f8fafc;">
+          <span style="color: #64748b; font-size: 0.85rem;">不含「其它」类收支；其不影响按标的拆分。</span>
+        </div>`;
+
+  return tableSection + footerSection;
+}
+
 /** 交易记录弹窗内表格 + 分页（供 full render 与股票代码筛选时局部更新共用） */
 function buildTradeHistoryModalTableRootInnerHtml(): string {
+  if (tradeHistoryModalTab === 'summary') {
+    return buildTradeHistorySymbolPnlSummaryTableInnerHtml();
+  }
   const filtered = getTradeHistoryFilteredTrades();
   const total = filtered.length;
   const totalPages = Math.max(1, Math.ceil(total / tradeHistoryPageSize));
@@ -3818,9 +3948,19 @@ function renderTradeHistoryModal(): string {
     <div onmousedown="onModalBackdropMouseDown(event, 'tradeHistory')" onmouseup="onModalBackdropMouseUp(event, 'tradeHistory')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
       <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; width: 100%; max-width: min(1320px, calc(100vw - 40px)); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
         <!-- 头部 -->
-        <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
-          <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">交易记录</h2>
-          <div style="display: flex; gap: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
+          <div style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 0;">
+            <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">交易记录</h2>
+            <div style="display: inline-flex; border-radius: 8px; border: 1px solid #e2e8f0; overflow: hidden;">
+              <button type="button" onclick="setTradeHistoryModalTab('list')" style="padding: 6px 14px; font-size: 0.82rem; border: none; cursor: pointer;${tradeHistoryModalTab === 'list' ? ' background: #667eea; color: white; font-weight: 600;' : ' background: white; color: #64748b; font-weight: 500;'}">
+                明细
+              </button>
+              <button type="button" onclick="setTradeHistoryModalTab('summary')" style="padding: 6px 14px; font-size: 0.82rem; border: none; border-left: 1px solid #e2e8f0; cursor: pointer;${tradeHistoryModalTab === 'summary' ? ' background: #667eea; color: white; font-weight: 600;' : ' background: white; color: #64748b; font-weight: 500;'}">
+                盈亏汇总
+              </button>
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
             <button onclick="openOtherTradeModal()" style="padding: 8px 16px; border: 1px solid #c7d2fe; border-radius: 6px; background: #eef2ff; color: #4338ca; font-size: 0.85rem; cursor: pointer;">
               ＋ 其它收支
             </button>
@@ -3836,6 +3976,11 @@ function renderTradeHistoryModal(): string {
         
         <!-- 筛选区域 -->
         <div style="padding: 16px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc;">
+          ${
+            tradeHistoryModalTab === 'summary'
+              ? `<p style="margin: 0 0 12px; color: #64748b; font-size: 0.78rem; line-height: 1.45;">盈亏汇总可按下方起止日期限定区间。「代码」「交易类型」「其它类别」不参与本表，仅用于「明细」视图。</p>`
+              : ''
+          }
           <div style="display: flex; gap: 12px; flex-wrap: nowrap; align-items: flex-end; overflow-x: auto;">
             <div style="flex-shrink: 0;">
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">股票代码</label>
@@ -4986,6 +5131,7 @@ void init();
 (window as any).openTradeHistoryModalForCalendarDay = openTradeHistoryModalForCalendarDay;
 (window as any).openTradeHistoryModalForCalendarMonth = openTradeHistoryModalForCalendarMonth;
 (window as any).closeTradeHistoryModal = closeTradeHistoryModal;
+(window as any).setTradeHistoryModalTab = setTradeHistoryModalTab;
 (window as any).setTradeHistoryFilter = setTradeHistoryFilter;
 (window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
 (window as any).setTradeHistoryPage = setTradeHistoryPage;
