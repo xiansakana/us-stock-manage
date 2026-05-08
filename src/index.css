@@ -672,3 +672,235 @@ table.holdings-table tbody tr:nth-child(even):hover {
     margin: auto;
   }
 }
+
+/* 累计盈亏可视化：折线与收益日历 */
+.pnl-line-chart-wrap {
+  margin-top: 12px;
+  width: 100%;
+  max-width: none;
+  position: relative;
+  user-select: none;
+  cursor: grab;
+}
+
+.pnl-line-chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  min-height: 200px;
+  cursor: crosshair;
+}
+
+.pnl-line-chart-hint-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-top: 8px;
+}
+
+.pnl-line-chart-hint-text {
+  flex: 1 1 auto;
+  min-width: 120px;
+  font-size: 0.72rem;
+  color: #94a3b8;
+  line-height: 1.4;
+}
+
+.pnl-line-chart-reset-btn {
+  flex: 0 0 auto;
+  padding: 5px 11px !important;
+  font-size: 0.75rem !important;
+}
+
+.pnl-line-chart-tooltip {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 10;
+  pointer-events: none;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.78rem;
+  color: #334155;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.14);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 80ms ease;
+  min-width: 128px;
+  max-width: min(280px, 90vw);
+}
+
+.pnl-line-chart-tooltip-date {
+  font-size: 0.72rem;
+  color: #64748b;
+  margin-bottom: 2px;
+}
+
+.pnl-line-chart-tooltip-val {
+  font-size: 0.8rem;
+}
+
+.pnl-line-chart-empty {
+  margin-top: 12px;
+  padding: 14px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  color: #64748b;
+}
+
+.pnl-cal-grid {
+  width: 100%;
+  max-width: none;
+}
+
+.pnl-cal-row {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.pnl-cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 6px;
+  font-size: 0.68rem;
+  color: #94a3b8;
+  text-align: center;
+}
+
+.pnl-cal-cell {
+  min-height: 64px;
+  aspect-ratio: unset;
+  border-radius: 6px;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  box-sizing: border-box;
+  padding: 0;
+  overflow: hidden;
+}
+
+.pnl-cal-cell-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 5px 6px 6px;
+  box-sizing: border-box;
+}
+
+.pnl-cal-daynum {
+  align-self: flex-end;
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: #64748b;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.pnl-cal-amt {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.15;
+  word-break: break-all;
+}
+
+.pnl-cal-pct {
+  font-size: 0.6rem;
+  color: #475569;
+  line-height: 1.15;
+}
+
+.pnl-cal-cell-placeholder {
+  visibility: hidden;
+  min-height: 64px;
+  border: none !important;
+  background: transparent !important;
+  padding: 0;
+}
+
+.pnl-cal-cell-empty {
+  visibility: hidden;
+  border-color: transparent !important;
+  background: transparent !important;
+}
+
+.pnl-cal-cell--interactive {
+  cursor: pointer;
+}
+
+.pnl-cal-cell--interactive:hover {
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.35);
+}
+
+.pnl-cal-cell--interactive:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+.pnl-cal-year-cell--interactive {
+  cursor: pointer;
+}
+
+.pnl-cal-year-cell--interactive:hover {
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.35);
+}
+
+.pnl-cal-year-cell--interactive:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+.pnl-cal-year-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  gap: 10px;
+  width: 100%;
+  max-width: none;
+}
+
+.pnl-cal-year-cell {
+  border-radius: 8px;
+  border: 1px solid rgba(226, 232, 240, 0.98);
+  padding: 10px 10px 8px;
+  min-height: 88px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-sizing: border-box;
+}
+
+.pnl-cal-year-mo {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #334155;
+}
+
+.pnl-cal-year-amt {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.pnl-cal-year-pct {
+  font-size: 0.68rem;
+  color: #64748b;
+}
+
+.pnl-cal-cell-out-range {
+  opacity: 0.45;
+  filter: grayscale(0.25);
+  font-weight: 500;
+  color: #94a3b8;
+}

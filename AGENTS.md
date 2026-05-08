@@ -42,6 +42,7 @@
 ## 开发规范
 
 - 使用 Tailwind CSS 进行样式开发
+- **全屏弹窗**：在半透明遮罩上使用 `mousedown` / `mouseup` 且 `event.target === event.currentTarget` 时关闭（或封装为 `onModalBackdropMouseDown` / `onModalBackdropMouseUp`），避免用 `click` 导致「内容区按下拖到遮罩释放」误关；内层白色区可保留 `onclick="event.stopPropagation()"`。
 
 ### 编码规范
 
