@@ -3711,7 +3711,7 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
       </tr>
     `;
 
-  const metaLine = `${escapeHtml(rangeLabel)} · 合计 ${rows.length} 个标的（含期权合约代码则按 FIFO×100 与盈亏面板一致）`;
+  const metaLine = `${escapeHtml(rangeLabel)} · 合计 ${rows.length} 个标的 · FIFO 与累计日历一致（区间内卖出的数量可匹配区间前先入队的买入）`;
 
   const tableSection = `
         <div style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">

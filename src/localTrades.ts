@@ -130,34 +130,59 @@ export interface SymbolTradePnlSummary {
   totalSellAmount: number;
   /** 该标的每笔买卖记录的 commission 之和 */
   totalCommission: number;
-  /** FIFO 已实现盈亏（毛额，与全市场 computeProfitLoss 算法一致） */
+  /** 区间内的卖出按 FIFO（含区间前先入队的买入批次）匹配的已实现盈亏毛额 */
   fifoRealizedGross: number;
   /** 盈亏金额 = fifoRealizedGross − totalCommission */
   netPnl: number;
 }
 
+function tradeCalendarDateKey(trade: TradeLike): string | null {
+  const d = trade.trade_date.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
+
 /**
- * 按标的汇总买卖金额、费用与 FIFO 已实现盈亏。
- * 仅统计 type 为 buy/sell 且代码非空的记录；可选日期区间与 computeProfitLoss 窗口一致。
+ * 按标的汇总：区间内的总买/卖/手续费；
+ * FIFO 已实现仅来自「成交日在区间内」的卖出，但与累计盈亏日历一致地消耗「区间内及之前」的买入队列（跨月仍可匹配数量）。
  */
 export function computeSymbolTradePnlSummaries(
   trades: readonly TradeLike[],
   options?: { startDate?: string; endDate?: string }
 ): SymbolTradePnlSummary[] {
-  const windowTrades = filterTradesForWindow(trades, options).filter(
-    (t) => (t.type === 'buy' || t.type === 'sell') && t.symbol.trim() !== ''
-  );
+  const start = options?.startDate;
+  const end = options?.endDate;
 
-  const bySym = new Map<string, TradeLike[]>();
-  for (const t of windowTrades) {
-    const sym = t.symbol.trim().toUpperCase();
-    if (!bySym.has(sym)) bySym.set(sym, []);
-    bySym.get(sym)!.push(t);
+  const symbolsInWindow = new Set<string>();
+  for (const t of trades) {
+    if (t.type !== 'buy' && t.type !== 'sell') continue;
+    const raw = t.symbol.trim();
+    if (!raw) continue;
+    const d = tradeCalendarDateKey(t);
+    if (!d) continue;
+    if (start && d < start) continue;
+    if (end && d > end) continue;
+    symbolsInWindow.add(raw.toUpperCase());
+  }
+
+  if (symbolsInWindow.size === 0) {
+    return [];
+  }
+  const bySymAll = new Map<string, TradeLike[]>();
+  for (const t of trades) {
+    if (t.type !== 'buy' && t.type !== 'sell') continue;
+    const symU = t.symbol.trim().toUpperCase();
+    if (!symU) continue;
+    if (!symbolsInWindow.has(symU)) continue;
+    const d = tradeCalendarDateKey(t);
+    if (!d) continue;
+    if (end && d > end) continue;
+    if (!bySymAll.has(symU)) bySymAll.set(symU, []);
+    bySymAll.get(symU)!.push(t);
   }
 
   const out: SymbolTradePnlSummary[] = [];
 
-  for (const [symbol, symTrades] of bySym) {
+  for (const [symbol, symTrades] of bySymAll) {
     symTrades.sort((a, b) => {
       const ta = tradeTime(a.trade_date);
       const tb = tradeTime(b.trade_date);
@@ -165,24 +190,42 @@ export function computeSymbolTradePnlSummaries(
       return a.id.localeCompare(b.id);
     });
 
-    let totalBuyAmount = 0;
-    let totalSellAmount = 0;
-    let totalCommission = 0;
-    for (const trade of symTrades) {
-      totalCommission += trade.commission;
-      if (trade.type === 'buy') {
-        totalBuyAmount += trade.total_amount;
+    const preStart: TradeLike[] = [];
+    const inWindow: TradeLike[] = [];
+    for (const t of symTrades) {
+      const d = tradeCalendarDateKey(t)!;
+      if (start && d < start) {
+        preStart.push(t);
       } else {
-        totalSellAmount += trade.total_amount;
+        inWindow.push(t);
       }
     }
 
+    if (inWindow.length === 0) {
+      continue;
+    }
+
     const buyQueue: Array<{ shares: number; price: number }> = [];
+    for (const t of preStart) {
+      if (t.type === 'buy') {
+        buyQueue.push({ shares: t.shares, price: t.price });
+      } else {
+        applyFifoSellToQueue(buyQueue, t.shares, t.price, t.symbol.trim());
+      }
+    }
+
+    let totalBuyAmount = 0;
+    let totalSellAmount = 0;
+    let totalCommission = 0;
     let fifoRealizedGross = 0;
-    for (const trade of symTrades) {
+
+    for (const trade of inWindow) {
+      totalCommission += trade.commission;
       if (trade.type === 'buy') {
+        totalBuyAmount += trade.total_amount;
         buyQueue.push({ shares: trade.shares, price: trade.price });
-      } else if (trade.type === 'sell') {
+      } else {
+        totalSellAmount += trade.total_amount;
         fifoRealizedGross += applyFifoSellToQueue(
           buyQueue,
           trade.shares,
