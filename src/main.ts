@@ -1,9 +1,17 @@
 ﻿// 类型定义
-import { computeProfitLoss, deriveHoldingsFromTrades } from './localTrades';
 import {
+  buildDailyCumulativeNetPnlSeries,
+  computeProfitLoss,
+  deriveHoldingsFromTrades,
+  expandCumulativeDailyToAllDays
+} from './localTrades';
+import {
+  parseAppTradeBackupXlsxArrayBuffer,
   parseBbaeXlsxArrayBuffer,
+  parseImportedTradeDatetime,
   parseMoomooXlsxArrayBuffer,
-  parseTradeImportLegacyCsv
+  parseTradeImportLegacyCsv,
+  TRADE_RECORD_EXPORT_SHEET_NAME
 } from './tradeImport';
 
 type TradeSignal = 'buy' | 'hold' | 'sell';
@@ -84,7 +92,9 @@ interface TradeRecord {
   id: string;
   symbol: string;
   name: string;
-  type: 'buy' | 'sell';
+  type: 'buy' | 'sell' | 'other';
+  /** 仅 other：用户填写的类别名 */
+  other_category?: string;
   shares: number;
   price: number;
   total_amount: number;
@@ -99,6 +109,7 @@ interface PnlStats {
   totalSellAmount: number;
   realizedPL: number;
   commission: number;
+  otherAmount: number;
   netPL: number;
 }
 
@@ -128,7 +139,9 @@ let tradeFormType: 'buy' | 'sell' = 'buy';
 let tradeHistoryModalOpen = false;
 let tradeHistoryFilter = {
   symbol: '',
-  type: '' as '' | 'buy' | 'sell',
+  type: '' as '' | 'buy' | 'sell' | 'other',
+  /** 仅匹配 `其它` 类记录的 `other_category`（子串、不区分大小写）；空则不筛 */
+  otherCategory: '',
   startDate: '',
   endDate: ''
 };
@@ -136,6 +149,45 @@ let tradeHistoryPage = 1;
 /** 交易记录弹窗每页条数（可选 10 / 20 / 50 / 100） */
 let tradeHistoryPageSize = 10;
 const TRADE_HISTORY_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
+
+/** 盈亏累计可视化：折线 / 收益日历 */
+let pnlVizMode: 'line' | 'calendar' = 'line';
+/** 日历当前月 YYYY-MM；空表示跟随浏览器「本月」用于 effective 计算 */
+let pnlCalendarYM = '';
+/** 年视图所选公历年 YYYY；空则与月视图年份或本年一致 */
+let pnlCalendarYearFocus = '';
+/** 日历粒度：月格 / 年内各月汇总 */
+let pnlCalendarGranularity: 'month' | 'year' = 'month';
+
+const PNL_LINE_CHART_MIN_POINTS = 8;
+
+let pnlLineChartGradientSeq = 0;
+
+/** 视窗：左边缘为浮点日索引（可亚日滑动），span 为截取天数 */
+interface PnlLineChartViewport {
+  startFloat: number;
+  span: number;
+}
+
+interface PnlLineChartHoverModel {
+  points: ReadonlyArray<{ date: string; cumulativeNet: number }>;
+  /** 查询裁剪后的整条序列长度，用于滚轮缩放/拖拽平移 */
+  fullSeriesLength: number;
+  /** 与视窗 startFloat 的小数部分一致，用于折线横移与悬停反算 */
+  slicePanFraction: number;
+  dayNetByDate: ReadonlyMap<string, number>;
+  /** 看板总资产（持仓市值+现金），用于名义收益率 tooltip */
+  totalAssets: number;
+  viewW: number;
+  viewH: number;
+  padL: number;
+  padR: number;
+  padT: number;
+  padB: number;
+}
+
+let pnlLineChartHoverModel: PnlLineChartHoverModel | null = null;
+let pnlLineChartHoverCleanup: (() => void) | null = null;
 
 /** 编辑交易弹窗状态 */
 let editTradeModalOpen = false;
@@ -145,6 +197,9 @@ let editingTrade: TradeRecord | null = null;
 let importTradeModalOpen = false;
 let importPreviewData: TradeRecord[] = [];
 let importError: string | null = null;
+
+/** 新增「其它收支」弹窗（利息、分红等） */
+let otherTradeModalOpen = false;
 
 /** 表格标的分组排序：代码=标的字母序，仓位=品类占组合%（dir：1 升序，-1 降序） */
 type TableSortKey = 'symbol' | 'weight';
@@ -691,6 +746,32 @@ function formatDatetimeLocalMinute(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/**
+ * 表单里 `datetime-local` 的常见值 `YYYY-MM-DDTHH:mm`（可选 `:ss`）须按本地墙钟解析；
+ * `new Date(该串)` 在 Chromium 等对无 Z ISO 倾向于按 UTC，东八区会差 8 小时。
+ */
+function parseDatetimeLocalPickerToIso(raw: string): string | null {
+  const t = raw.trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(t);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10) - 1;
+  const day = parseInt(m[3], 10);
+  const hh = parseInt(m[4], 10);
+  const mi = parseInt(m[5], 10);
+  const ss = m[6] !== undefined ? parseInt(m[6], 10) : 0;
+  const d = new Date(y, mo, day, hh, mi, ss);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+/** 交易表单 / 录入：优先按 datetime-local，否则走导入共用解析（斜杠手写等）。 */
+function parseUserEnteredTradeDatetimeToIso(raw: string): string {
+  const t = raw.trim();
+  if (!t) return new Date().toISOString();
+  return parseDatetimeLocalPickerToIso(t) ?? parseImportedTradeDatetime(t);
+}
+
 /** CSV 旧版单列「类型」：期权 / 股票 / Finnhub 证券类型 */
 function parseLegacyCsvTypeColumn(combined: string): { isOption: boolean; instrumentType?: string } {
   const raw = combined.trim();
@@ -802,19 +883,15 @@ function closeEditTradeModal(): void {
 // 提交编辑交易
 function submitEditTrade(): void {
   if (!editingTrade) return;
-  
-  const sharesEl = document.getElementById('edit-trade-shares') as HTMLInputElement | null;
-  const priceEl = document.getElementById('edit-trade-price') as HTMLInputElement | null;
+
   const commissionEl = document.getElementById('edit-trade-commission') as HTMLInputElement | null;
   const dateEl = document.getElementById('edit-trade-date') as HTMLInputElement | null;
-  
-  const shares = parseFloat(sharesEl?.value || '0');
-  const price = parseFloat(priceEl?.value || '0');
   const commission = parseFloat(commissionEl?.value || '0');
   const rawDt = (dateEl?.value ?? '').trim();
   let tradeAtIso: string | undefined;
   if (rawDt) {
-    const tradeAt = new Date(rawDt);
+    const tradeAtIsoCand = parseUserEnteredTradeDatetimeToIso(rawDt);
+    const tradeAt = new Date(tradeAtIsoCand);
     if (Number.isNaN(tradeAt.getTime())) {
       renderError('交易时间无效');
       return;
@@ -823,8 +900,55 @@ function submitEditTrade(): void {
       renderError('交易时间不能晚于当前时刻');
       return;
     }
-    tradeAtIso = tradeAt.toISOString();
+    tradeAtIso = tradeAtIsoCand;
   }
+
+  if (editingTrade.type === 'other') {
+    const catEl = document.getElementById('edit-other-category') as HTMLInputElement | null;
+    const symEl = document.getElementById('edit-other-symbol') as HTMLInputElement | null;
+    const nameEl = document.getElementById('edit-other-name') as HTMLInputElement | null;
+    const amtEl = document.getElementById('edit-other-amount') as HTMLInputElement | null;
+    const cat = (catEl?.value ?? '').trim();
+    const amt = parseFloat(amtEl?.value ?? '');
+    if (!cat) {
+      renderError('请填写类别');
+      return;
+    }
+    if (!Number.isFinite(amt) || amt === 0) {
+      renderError('金额须为非零数字（正数为入账，负数为扣款）');
+      return;
+    }
+    if (!Number.isFinite(commission) || commission < 0) {
+      renderError('手续费须 ≥ 0');
+      return;
+    }
+    let sym = (symEl?.value ?? '').trim().toUpperCase();
+    if (!sym) sym = 'OTHER';
+
+    const success = updateTradeRecord(editingTrade.id, {
+      other_category: cat,
+      symbol: sym,
+      name: (nameEl?.value ?? '').trim(),
+      total_amount: amt,
+      commission,
+      trade_date: tradeAtIso
+    });
+
+    if (success) {
+      loadPnlStatsOnStartup();
+      renderSuccess('记录已更新');
+      closeEditTradeModal();
+      render();
+    } else {
+      renderError('更新失败：未找到该笔交易');
+    }
+    return;
+  }
+
+  const sharesEl = document.getElementById('edit-trade-shares') as HTMLInputElement | null;
+  const priceEl = document.getElementById('edit-trade-price') as HTMLInputElement | null;
+  const shares = parseFloat(sharesEl?.value || '0');
+  const price = parseFloat(priceEl?.value || '0');
 
   if (shares <= 0 || price <= 0) {
     renderError('股数和价格必须大于 0');
@@ -837,7 +961,7 @@ function submitEditTrade(): void {
     commission,
     trade_date: tradeAtIso
   });
-  
+
   if (success) {
     loadPnlStatsOnStartup();
     renderSuccess('交易记录已更新');
@@ -863,7 +987,7 @@ function submitTrade(): void {
   if (!rawDt) {
     tradeAt = new Date();
   } else {
-    tradeAt = new Date(rawDt);
+    tradeAt = new Date(parseUserEnteredTradeDatetimeToIso(rawDt));
     if (Number.isNaN(tradeAt.getTime())) {
       renderError('交易时间无效');
       return;
@@ -1197,6 +1321,31 @@ function parseTradesFromLocalStorage(raw: string | null): TradeRecord[] {
       if (!item || typeof item !== 'object') continue;
       const o = item as Record<string, unknown>;
       const id = String(o.id ?? '');
+      const typRaw = String(o.type ?? '').toLowerCase();
+      const isOther = typRaw === 'other' || typRaw === '其它';
+      if (isOther) {
+        let symbol = String(o.symbol ?? '').trim().toUpperCase();
+        if (!symbol) symbol = 'OTHER';
+        const cat = String(o.other_category ?? o.otherCategory ?? '').trim();
+        if (!cat) continue;
+        const totalRaw = Number(o.total_amount);
+        if (!Number.isFinite(totalRaw) || totalRaw === 0) continue;
+        const commissionRaw = Number(o.commission);
+        out.push({
+          id: id || crypto.randomUUID(),
+          symbol,
+          name: String(o.name ?? cat),
+          type: 'other',
+          other_category: cat,
+          shares: 1,
+          price: 0,
+          total_amount: totalRaw,
+          commission: Number.isFinite(commissionRaw) && commissionRaw >= 0 ? commissionRaw : 0,
+          trade_date: String(o.trade_date ?? new Date().toISOString()),
+          created_at: String(o.created_at ?? new Date().toISOString())
+        });
+        continue;
+      }
       const symbol = String(o.symbol ?? '').trim().toUpperCase();
       if (!symbol) continue;
       const shares = Number(o.shares);
@@ -1204,11 +1353,12 @@ function parseTradesFromLocalStorage(raw: string | null): TradeRecord[] {
       if (!Number.isFinite(shares) || !Number.isFinite(price) || shares <= 0 || price <= 0) continue;
       const totalRaw = Number(o.total_amount);
       const commissionRaw = Number(o.commission);
+      const isSell = o.type === 'sell' || o.type === '卖出';
       out.push({
         id: id || crypto.randomUUID(),
         symbol,
         name: String(o.name ?? ''),
-        type: o.type === 'sell' ? 'sell' : 'buy',
+        type: isSell ? 'sell' : 'buy',
         shares,
         price,
         total_amount:
@@ -1233,11 +1383,12 @@ function loadPersistedTrades(): void {
 
 // ========== 交易记录（本地存储） ==========
 
-/** 单笔交易对现金的净变动：买入付出本金+手续费；卖出收回本金−手续费 */
+/** 单笔交易对现金的净变动：买入付出本金+手续费；卖出/其它为毛额−手续费（其它毛额可正可负） */
 function cashDeltaForTrade(trade: Pick<TradeRecord, 'type' | 'total_amount' | 'commission'>): number {
   const fee = Number(trade.commission) || 0;
   const notional = trade.total_amount;
   if (trade.type === 'buy') return -(notional + fee);
+  if (trade.type === 'sell') return notional - fee;
   return notional - fee;
 }
 
@@ -1275,6 +1426,45 @@ function addTradeRecord(trade: {
   return true;
 }
 
+/** 利息/分红/卡券等：毛额可正可负；净额=毛额−手续费；不参与 FIFO 持仓 */
+function addOtherTradeRecord(input: {
+  other_category: string;
+  symbol?: string;
+  name?: string;
+  total_amount: number;
+  commission?: number;
+  trade_date?: string;
+}): boolean {
+  const cat = input.other_category.trim();
+  if (!cat) return false;
+  const amt = Number(input.total_amount);
+  if (!Number.isFinite(amt) || amt === 0) return false;
+  const fee = input.commission ?? 0;
+  if (!Number.isFinite(fee) || fee < 0) return false;
+  let sym = (input.symbol ?? '').trim().toUpperCase();
+  if (!sym) sym = 'OTHER';
+  const nm = (input.name ?? '').trim() || cat;
+  const row: TradeRecord = {
+    id: crypto.randomUUID(),
+    symbol: sym,
+    name: nm,
+    type: 'other',
+    other_category: cat,
+    shares: 1,
+    price: 0,
+    total_amount: amt,
+    commission: fee,
+    trade_date: input.trade_date ?? new Date().toISOString(),
+    created_at: new Date().toISOString()
+  };
+  state.cash += cashDeltaForTrade(row);
+  state.trades.push(row);
+  sortTradesByDateDesc(state.trades);
+  flushPersistToLocal();
+  syncStocksFromTrades();
+  return true;
+}
+
 function deleteTradeRecord(tradeId: string): boolean {
   const removed = state.trades.find((t) => t.id === tradeId);
   if (!removed) return false;
@@ -1292,7 +1482,16 @@ function deleteTradeRecord(tradeId: string): boolean {
 
 function updateTradeRecord(
   tradeId: string,
-  updates: { shares?: number; price?: number; commission?: number; trade_date?: string }
+  updates: {
+    shares?: number;
+    price?: number;
+    commission?: number;
+    trade_date?: string;
+    symbol?: string;
+    name?: string;
+    other_category?: string;
+    total_amount?: number;
+  }
 ): boolean {
   const t = state.trades.find((x) => x.id === tradeId);
   if (!t) return false;
@@ -1301,6 +1500,35 @@ function updateTradeRecord(
     total_amount: t.total_amount,
     commission: t.commission
   };
+
+  if (t.type === 'other') {
+    if (updates.other_category !== undefined) {
+      const c = updates.other_category.trim();
+      if (!c) return false;
+      t.other_category = c;
+    }
+    if (updates.symbol !== undefined) {
+      let s = updates.symbol.trim().toUpperCase();
+      if (!s) s = 'OTHER';
+      t.symbol = s;
+    }
+    if (updates.name !== undefined) t.name = updates.name.trim();
+    if (updates.total_amount !== undefined) {
+      if (!Number.isFinite(updates.total_amount) || updates.total_amount === 0) return false;
+      t.total_amount = updates.total_amount;
+    }
+    if (updates.commission !== undefined) {
+      if (updates.commission < 0) return false;
+      t.commission = updates.commission;
+    }
+    if (updates.trade_date !== undefined) t.trade_date = updates.trade_date;
+    state.cash += cashDeltaForTrade(t) - cashDeltaForTrade(oldSnap);
+    sortTradesByDateDesc(state.trades);
+    flushPersistToLocal();
+    syncStocksFromTrades();
+    return true;
+  }
+
   if (updates.shares !== undefined) {
     if (updates.shares <= 0) return false;
     t.shares = updates.shares;
@@ -1324,68 +1552,35 @@ function updateTradeRecord(
   return true;
 }
 
-// 导出交易记录为 CSV
-function exportTradesToCSV(): void {
+// 导出交易记录为 xlsx（与本应用「本应用导出」导入一致）
+async function exportTradesToXlsx(): Promise<void> {
   if (state.trades.length === 0) {
     renderError('没有交易记录可导出');
     return;
   }
-  
-  const headers = ['时间', '类型', '代码', '名称', '股数', '价格', '金额', '手续费'];
-  const rows = state.trades.map(trade => [
-    new Date(trade.trade_date).toLocaleString('zh-CN'),
-    trade.type === 'buy' ? '买入' : '卖出',
-    trade.symbol,
-    trade.name,
-    trade.shares.toString(),
-    trade.price.toString(),
-    trade.total_amount.toString(),
-    trade.commission.toString()
-  ]);
-  
-  const csvContent = [headers, ...rows]
-    .map(row => row.map(cell => `"${cell}"`).join(','))
-    .join('\n');
-  
-  const BOM = '\uFEFF'; // UTF-8 BOM
-  const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `交易记录_${new Date().toISOString().split('T')[0]}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
-  
-  renderSuccess('交易记录已导出');
-}
-
-// 导出交易记录为 JSON
-function exportTradesToJSON(): void {
-  if (state.trades.length === 0) {
-    renderError('没有交易记录可导出');
-    return;
+  try {
+    const XLSX = await import('xlsx');
+    const header = ['时间', '类型', '其它类别', '代码', '名称', '股数', '价格', '金额', '手续费'];
+    const dataRows: (string | number)[][] = state.trades.map((trade) => [
+      new Date(trade.trade_date).toLocaleString('zh-CN'),
+      trade.type === 'buy' ? '买入' : trade.type === 'sell' ? '卖出' : '其它',
+      trade.type === 'other' ? (trade.other_category ?? '') : '',
+      trade.symbol,
+      trade.name,
+      trade.shares,
+      trade.price,
+      trade.total_amount,
+      trade.commission
+    ]);
+    const ws = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, TRADE_RECORD_EXPORT_SHEET_NAME);
+    XLSX.writeFile(wb, `交易记录_${new Date().toISOString().split('T')[0]}.xlsx`);
+    renderSuccess('交易记录已导出为 Excel');
+  } catch (error) {
+    console.error(error);
+    renderError(`导出失败: ${error instanceof Error ? error.message : String(error)}`);
   }
-  
-  const exportData = state.trades.map(trade => ({
-    symbol: trade.symbol,
-    name: trade.name,
-    type: trade.type === 'buy' ? '买入' : '卖出',
-    shares: trade.shares,
-    price: trade.price,
-    commission: trade.commission,
-    trade_date: trade.trade_date
-  }));
-  
-  const jsonContent = JSON.stringify(exportData, null, 2);
-  const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `交易记录_${new Date().toISOString().split('T')[0]}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
-  
-  renderSuccess('交易记录已导出');
 }
 
 // 打开导入弹窗
@@ -1455,12 +1650,20 @@ function handleBbaeTradeImport(event: Event): void {
   , '未解析到有效记录：请确认 xlsx 为 BBAE 订单导出（工作表含「股票代码」或「期权代码」，订单状态为「已成」）');
 }
 
-/** 本应用导出的交易 CSV / JSON */
+/** 本应用导出的交易 xlsx（推荐）；仍可读旧版 .csv / .json */
 function handleTradeBackupImport(event: Event): void {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+
+  if (ext === 'xlsx' || ext === 'xls') {
+    readXlsxArrayBuffer(file, input, async (buf) =>
+      (await parseAppTradeBackupXlsxArrayBuffer(buf)) as TradeRecord[]
+    , '文件中无有效交易记录（请使用本应用导出的「交易记录」xlsx，或首张表与本应用导出表头一致）');
+    return;
+  }
+
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
@@ -1470,16 +1673,14 @@ function handleTradeBackupImport(event: Event): void {
       } else if (ext === 'json') {
         importPreviewData = parseJSON(content);
       } else {
-        importError = '请上传本应用导出的 .csv 或 .json';
+        importError = '请上传本应用导出的 .xlsx，或旧的 .csv / .json';
         importPreviewData = [];
         input.value = '';
         render();
         return;
       }
       importError =
-        importPreviewData.length === 0
-          ? '文件中无有效交易记录（需为本应用「导出交易」的 CSV/JSON）'
-          : null;
+        importPreviewData.length === 0 ? '文件中无有效交易记录' : null;
     } catch (err) {
       importError = `解析失败: ${(err as Error).message}`;
       importPreviewData = [];
@@ -1492,15 +1693,57 @@ function handleTradeBackupImport(event: Event): void {
 
 // 解析 JSON
 function parseJSON(content: string): TradeRecord[] {
-  const data = JSON.parse(content);
-  const arr = Array.isArray(data) ? data : data.trades || [];
-  
-  return arr.map((item: Record<string, unknown>, index: number) => {
-    const type = (item.type as string);
-    const shares = parseFloat(String(item.shares || 0));
-    const price = parseFloat(String(item.price || 0));
-    const symbolU = String(item.symbol || item.code || '').toUpperCase();
-    let totalAmt = parseFloat(String(item.total_amount || item.amount || ''));
+  const data: unknown = JSON.parse(content);
+  let arr: unknown[];
+  if (Array.isArray(data)) {
+    arr = data;
+  } else if (
+    data &&
+    typeof data === 'object' &&
+    Array.isArray((data as { trades?: unknown }).trades)
+  ) {
+    arr = (data as { trades: unknown[] }).trades;
+  } else {
+    arr = [];
+  }
+
+  const mapped: Array<TradeRecord | null> = arr.map((item: unknown, index: number): TradeRecord | null => {
+    if (!item || typeof item !== 'object') return null;
+    const record = item as Record<string, unknown>;
+    const typeRaw = String(record.type ?? '');
+    const isOther =
+      typeRaw === '其它' ||
+      typeRaw.toLowerCase() === 'other' ||
+      typeRaw === 'other_income';
+
+    if (isOther) {
+      const symbolU = String(record.symbol ?? record.code ?? 'OTHER')
+        .trim()
+        .toUpperCase()
+        || 'OTHER';
+      const cat = String(record.other_category ?? record.otherCategory ?? '').trim();
+      const totalAmt = Number(record.total_amount ?? record.amount);
+      if (!cat || !Number.isFinite(totalAmt) || totalAmt === 0) return null;
+      const feeRaw = parseFloat(String(record.commission ?? record.fee ?? 0));
+      return {
+        id: `import-${index}-${Date.now()}`,
+        symbol: symbolU,
+        name: String(record.name ?? cat),
+        type: 'other',
+        other_category: cat,
+        shares: 1,
+        price: 0,
+        total_amount: totalAmt,
+        commission: Number.isFinite(feeRaw) && feeRaw >= 0 ? feeRaw : 0,
+        trade_date: parseImportedTradeDatetime(record.trade_date),
+        created_at: new Date().toISOString()
+      };
+    }
+
+    const shares = parseFloat(String(record.shares ?? 0));
+    const price = parseFloat(String(record.price ?? 0));
+    const symbolU = String(record.symbol ?? record.code ?? '').toUpperCase();
+    let totalAmt = parseFloat(String(record.total_amount ?? record.amount ?? ''));
     if (!Number.isFinite(totalAmt) || totalAmt <= 0) {
       totalAmt = shares * price * (isOptionSymbol(symbolU) ? 100 : 1);
     }
@@ -1508,18 +1751,31 @@ function parseJSON(content: string): TradeRecord[] {
     return {
       id: `import-${index}-${Date.now()}`,
       symbol: symbolU,
-      name: String(item.name || item.stockName || ''),
-      type: (type === '买入' || type === 'buy' || type === 'BUY') ? 'buy' as const : 'sell' as const,
+      name: String(record.name ?? record.stockName ?? ''),
+      type:
+        typeRaw === '买入' || typeRaw === 'buy' || typeRaw === 'BUY'
+          ? 'buy'
+          : 'sell',
       shares,
       price,
       total_amount: totalAmt,
-      commission: parseFloat(String(item.commission || item.fee || 0)),
-      trade_date: item.trade_date ? new Date(item.trade_date as string).toISOString() : new Date().toISOString(),
+      commission: (() => {
+        const f = parseFloat(String(record.commission ?? record.fee ?? 0));
+        return Number.isFinite(f) && f >= 0 ? f : 0;
+      })(),
+      trade_date: parseImportedTradeDatetime(record.trade_date),
       created_at: new Date().toISOString()
     };
-  }).filter((t: TradeRecord) => t.symbol && t.shares > 0 && t.price > 0);
-}
+  });
 
+  return mapped.filter((t: TradeRecord | null): t is TradeRecord => {
+    if (t === null) return false;
+    if (!t.symbol) return false;
+    return t.type === 'other'
+      ? !!(t.other_category && t.total_amount !== 0)
+      : t.shares > 0 && t.price > 0;
+  });
+}
 // 确认导入
 function confirmImportTrades(): void {
   if (importPreviewData.length === 0) {
@@ -1529,6 +1785,32 @@ function confirmImportTrades(): void {
 
   let failCount = 0;
   for (const trade of importPreviewData) {
+    if (trade.type === 'other') {
+      if (
+        !trade.other_category?.trim() ||
+        !Number.isFinite(trade.total_amount) ||
+        trade.total_amount === 0
+      ) {
+        failCount++;
+        continue;
+      }
+      const row: TradeRecord = {
+        id: crypto.randomUUID(),
+        symbol: trade.symbol.trim().toUpperCase() || 'OTHER',
+        name: trade.name,
+        type: 'other',
+        other_category: trade.other_category.trim(),
+        shares: 1,
+        price: 0,
+        total_amount: trade.total_amount,
+        commission: trade.commission ?? 0,
+        trade_date: trade.trade_date,
+        created_at: new Date().toISOString()
+      };
+      state.cash += cashDeltaForTrade(row);
+      state.trades.push(row);
+      continue;
+    }
     const shares = trade.shares;
     const price = trade.price;
     if (shares <= 0 || price <= 0 || !trade.symbol) {
@@ -1600,6 +1882,1035 @@ function refreshPnlStats(): void {
   if (eEl) state.pnlEndDate = eEl.value;
   loadPnlStatsOnStartup();
   render();
+}
+
+function setPnlVizMode(mode: string): void {
+  if (mode === 'line' || mode === 'calendar') {
+    pnlVizMode = mode;
+    render();
+  }
+}
+
+function effectivePnlCalendarYM(): string {
+  if (pnlCalendarYM) return pnlCalendarYM;
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function shiftPnlCalendarMonth(delta: number): void {
+  const base = effectivePnlCalendarYM();
+  const y = Number(base.slice(0, 4));
+  const m = Number(base.slice(5, 7));
+  const dt = new Date(y, m - 1 + delta, 1);
+  pnlCalendarYM = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+  pnlCalendarYearFocus = `${dt.getFullYear()}`;
+  render();
+}
+
+function resetPnlCalendarMonth(): void {
+  pnlCalendarYM = '';
+  pnlCalendarYearFocus = '';
+  render();
+}
+
+function sparseTradeYearBounds(sparse: readonly { date: string }[]): { minY: number; maxY: number } {
+  let cy = new Date().getFullYear();
+  if (sparse.length === 0) return { minY: cy, maxY: cy };
+  const ys: number[] = [];
+  for (const p of sparse) {
+    const y = Number(p.date.slice(0, 4));
+    if (Number.isFinite(y)) ys.push(y);
+  }
+  if (ys.length === 0) return { minY: cy, maxY: cy };
+  return { minY: Math.min(...ys), maxY: Math.max(...ys, cy) };
+}
+
+function utcGregorianMondayOffset(year: number, month1Based: number): number {
+  const wd = new Date(Date.UTC(year, month1Based - 1, 1, 12, 0, 0)).getUTCDay();
+  return (wd + 6) % 7;
+}
+
+function utcDaysInGregorianMonth(year: number, month1Based: number): number {
+  return new Date(Date.UTC(year, month1Based, 0, 12, 0, 0)).getUTCDate();
+}
+
+function ymKey(y: number, m1: number, d: number): string {
+  return `${y}-${String(m1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+function effectiveYmPartsNow(): { y: number; m: number } {
+  const ym = effectivePnlCalendarYM();
+  const mch = /^(\d{4})-(\d{2})$/.exec(ym);
+  if (!mch) {
+    const d = new Date();
+    return { y: d.getFullYear(), m: d.getMonth() + 1 };
+  }
+  return { y: Number(mch[1]), m: Number(mch[2]) };
+}
+
+/** 年视图用到的公历年 */
+function effectiveCalendarYearForYearView(): number {
+  const raw = pnlCalendarYearFocus.trim();
+  const mch = /^(\d{4})$/.exec(raw);
+  if (mch) {
+    const y = Number(mch[1]);
+    if (y >= 1980 && y <= 2100) return y;
+  }
+  return effectiveYmPartsNow().y;
+}
+
+function setPnlCalendarYmFromDom(): void {
+  const yEl = document.getElementById('pnl-cal-year-sel') as HTMLSelectElement | null;
+  const moEl = document.getElementById('pnl-cal-month-sel') as HTMLSelectElement | null;
+  if (!yEl || !moEl) return;
+  setPnlCalendarYmSelect(parseInt(yEl.value, 10), parseInt(moEl.value, 10));
+}
+
+function setPnlCalendarYmSelect(year: number, mo: number): void {
+  if (!Number.isFinite(year) || !Number.isFinite(mo)) return;
+  const m = Math.min(12, Math.max(1, Math.floor(mo)));
+  const yy = Math.min(2100, Math.max(1980, Math.floor(year)));
+  pnlCalendarYM = `${yy}-${String(m).padStart(2, '0')}`;
+  pnlCalendarYearFocus = `${yy}`;
+  render();
+}
+
+function setPnlCalendarYearFocusOnlyFromDom(): void {
+  const el = document.getElementById('pnl-cal-year-grid-sel') as HTMLSelectElement | null;
+  if (!el) return;
+  setPnlCalendarYearFocusSelect(parseInt(el.value, 10));
+}
+
+function setPnlCalendarYearFocusSelect(y: number): void {
+  if (!Number.isFinite(y)) return;
+  const yy = Math.min(2100, Math.max(1980, Math.floor(y)));
+  pnlCalendarYearFocus = `${yy}`;
+  render();
+}
+
+function setPnlCalendarGranularity(mode: string): void {
+  if (mode === 'month' || mode === 'year') {
+    pnlCalendarGranularity = mode;
+    render();
+  }
+}
+
+function shiftPnlCalendarYearFocus(delta: number): void {
+  const y = effectiveCalendarYearForYearView() + delta;
+  pnlCalendarYearFocus = `${Math.min(2100, Math.max(1980, y))}`;
+  render();
+}
+
+function formatPnlUsdTinyOneLine(net: number): string {
+  const sign = net >= 0 ? '+' : '-';
+  const a = Math.abs(net);
+  if (a >= 1_000_000) return `${sign}$${formatNumber(a / 1_000_000, 2)}m`;
+  if (a >= 10_000) return `${sign}$${formatNumber(a / 1_000, 1)}k`;
+  if (a >= 1000) return `${sign}$${formatNumber(a / 1_000, 2)}k`;
+  if (a < 1e-6 && a > 0) return `${sign}$${formatNumber(a, 2)}`;
+  return `${sign}$${formatNumber(a, Math.abs(net) < 1 ? 2 : 0)}`;
+}
+
+/**
+ * 名义收益率（小数）：累计净盈亏 ÷（当前总资产 − 累计净盈亏）。
+ * 总资产取看板「总资产」= 持仓市值 + 现金；分母须为正。
+ */
+function pnlNominalReturnDecimal(cumulativeNet: number, totalAssets: number): number | null {
+  if (!Number.isFinite(totalAssets) || !Number.isFinite(cumulativeNet)) return null;
+  const base = totalAssets - cumulativeNet;
+  if (base <= 1e-9) return null;
+  return cumulativeNet / base;
+}
+
+function formatPnlNominalReturnPct(cumulativeNet: number, totalAssets: number): string {
+  const r = pnlNominalReturnDecimal(cumulativeNet, totalAssets);
+  if (r === null) return '—';
+  return formatPercent(r * 100);
+}
+
+/** 区间净变动 Δ（非零）相对隐含本金 TA−cum<sub>Δ前</sub> 的收益率，与名义收益率同源分母。 */
+function formatPnlIncrementalYieldPct(
+  deltaNet: number,
+  cumBeforeDelta: number,
+  totalAssets: number
+): string {
+  if (!Number.isFinite(deltaNet) || !Number.isFinite(cumBeforeDelta) || !Number.isFinite(totalAssets)) {
+    return '—';
+  }
+  if (Math.abs(deltaNet) < 1e-12) return '—';
+  const base = totalAssets - cumBeforeDelta;
+  if (base <= 1e-9) return '—';
+  const p = (deltaNet / base) * 100;
+  return `${p >= 0 ? '+' : ''}${formatNumber(p, 2)}%`;
+}
+
+function lastGregorianCalendarKeyStrictlyBeforeMonth(y: number, month: number): string {
+  if (month > 1) {
+    const dim = utcDaysInGregorianMonth(y, month - 1);
+    return ymKey(y, month - 1, dim);
+  }
+  const dim = utcDaysInGregorianMonth(y - 1, 12);
+  return ymKey(y - 1, 12, dim);
+}
+
+/** 区间内净盈亏 Δ ÷ 全历史末日累计净盈亏（×100%）；末日累计绝对值过小时不可用。 */
+function formatPnlPeriodDeltaVsLifetimePct(periodDelta: number, cumLifetimeEnd: number): string {
+  if (!Number.isFinite(periodDelta) || !Number.isFinite(cumLifetimeEnd)) return '—';
+  if (Math.abs(cumLifetimeEnd) < 1e-9) return '—';
+  const pct = (periodDelta / cumLifetimeEnd) * 100;
+  return `${pct >= 0 ? '+' : ''}${formatNumber(pct, 1)}%`;
+}
+
+/** 自然日 d 日终累计净盈亏（expanded 序列为按日填充的累计值） */
+function cumulativeNetAtEndOfDayFromExpanded(
+  d: string,
+  expanded: ReadonlyArray<{ date: string; cumulativeNet: number }>
+): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || expanded.length === 0) return 0;
+  const first = expanded[0].date;
+  const last = expanded[expanded.length - 1].date;
+  if (d < first) return 0;
+  if (d > last) return expanded[expanded.length - 1].cumulativeNet;
+  let lo = 0;
+  let hi = expanded.length - 1;
+  let ans = expanded[0].cumulativeNet;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const md = expanded[mid].date;
+    if (md <= d) {
+      ans = expanded[mid].cumulativeNet;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return ans;
+}
+
+function buildPnlMonthCalendarGridInner(
+  yNum: number,
+  mNum: number,
+  dayNetByDate: ReadonlyMap<string, number>,
+  expandedCumulative: ReadonlyArray<{ date: string; cumulativeNet: number }>,
+  totalAssets: number
+): string {
+  const dim = utcDaysInGregorianMonth(yNum, mNum);
+  let maxAbs = 0;
+  for (let d = 1; d <= dim; d++) {
+    const key = ymKey(yNum, mNum, d);
+    if (!pnlTradeDateWithinQuery(key)) continue;
+    const v = dayNetByDate.get(key) ?? 0;
+    maxAbs = Math.max(maxAbs, Math.abs(v));
+  }
+  if (maxAbs === 0) maxAbs = 1;
+
+  const mondayLead = utcGregorianMondayOffset(yNum, mNum);
+  const gridCells: Array<{ d: number | null; key: string | null }> = [];
+  for (let i = 0; i < mondayLead; i++) {
+    gridCells.push({ d: null, key: null });
+  }
+  for (let d = 1; d <= dim; d++) {
+    gridCells.push({ d, key: ymKey(yNum, mNum, d) });
+  }
+  while (gridCells.length % 7 !== 0) {
+    gridCells.push({ d: null, key: null });
+  }
+
+  const rows: string[] = [];
+  for (let r = 0; r < gridCells.length; r += 7) {
+    const chunk = gridCells.slice(r, r + 7);
+    const tds = chunk
+      .map((c) => {
+        if (c.d === null || c.key === null) {
+          return '<div class="pnl-cal-cell pnl-cal-cell-placeholder" aria-hidden="true"></div>';
+        }
+        const inRange = pnlTradeDateWithinQuery(c.key);
+        const hasTrade = dayNetByDate.has(c.key);
+        const net = dayNetByDate.get(c.key) ?? 0;
+        const bg = inRange ? pnlCalendarCellBackground(hasTrade ? net : 0, maxAbs) : '#f8fafc';
+        const cumEod = inRange ? cumulativeNetAtEndOfDayFromExpanded(c.key, expandedCumulative) : 0;
+        const cumBeforeDay = cumEod - net;
+        const yieldDay = formatPnlIncrementalYieldPct(net, cumBeforeDay, totalAssets);
+        const retS = inRange ? formatPnlNominalReturnPct(cumEod, totalAssets) : '—';
+
+        let title: string;
+        if (!inRange) {
+          title = `${c.key}（不在查询时间段）`;
+        } else if (!hasTrade) {
+          title = `${c.key} 无成交 · 日终名义收益率 ${retS}`;
+        } else {
+          title = `${c.key} 当日净变动 ${net >= 0 ? '+' : ''}$${formatNumber(net)} · 当日收益率 ${yieldDay} · 累计名义 ${retS}`;
+        }
+        const amtLine = !inRange ? '—' : hasTrade ? formatPnlUsdTinyOneLine(net) : '$0';
+        const retPart = retS;
+        const sharePart = inRange && hasTrade ? `月 ${yieldDay}` : '';
+        const pctLine =
+          !inRange ? '—' : [sharePart, `收 ${retPart}`].filter((s) => s.length > 0).join(' · ');
+        const titleClickHint = '点击查看当日交易';
+        const oc = inRange ? '' : ' pnl-cal-cell-out-range';
+        const keyAttr = escapeHtmlAttr(c.key);
+        return `<div class="pnl-cal-cell pnl-cal-cell--interactive${oc}" style="background:${bg}" role="button" tabindex="0"
+          title="${escapeHtmlAttr(`${title} · ${titleClickHint}`)}"
+          onclick="openTradeHistoryModalForCalendarDay('${keyAttr}')"
+          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openTradeHistoryModalForCalendarDay('${keyAttr}')}">
+          <div class="pnl-cal-cell-stack">
+            <span class="pnl-cal-daynum">${c.d}</span>
+            <span class="pnl-cal-amt">${escapeHtml(amtLine)}</span>
+            <span class="pnl-cal-pct">${escapeHtml(pctLine)}</span>
+          </div>
+        </div>`;
+      })
+      .join('');
+    rows.push(`<div class="pnl-cal-row">${tds}</div>`);
+  }
+  return rows.join('');
+}
+
+function buildPnlYearCalendarInner(
+  yNum: number,
+  dayNetByDate: ReadonlyMap<string, number>,
+  expandedCumulative: ReadonlyArray<{ date: string; cumulativeNet: number }>,
+  totalAssets: number
+): string {
+  const monthSums = new Map<number, number>();
+  for (let m = 1; m <= 12; m++) {
+    let sm = 0;
+    const dim = utcDaysInGregorianMonth(yNum, m);
+    for (let d = 1; d <= dim; d++) {
+      const key = ymKey(yNum, m, d);
+      if (!pnlTradeDateWithinQuery(key)) continue;
+      sm += dayNetByDate.get(key) ?? 0;
+    }
+    monthSums.set(m, sm);
+  }
+
+  let maxMonthAbs = 0;
+  for (const v of monthSums.values()) {
+    maxMonthAbs = Math.max(maxMonthAbs, Math.abs(v));
+  }
+  if (maxMonthAbs === 0) maxMonthAbs = 1;
+
+  const cells: string[] = [];
+  for (let m = 1; m <= 12; m++) {
+    const sm = monthSums.get(m) ?? 0;
+    const prevLastKey = lastGregorianCalendarKeyStrictlyBeforeMonth(yNum, m);
+    const cumBeforeMonth = cumulativeNetAtEndOfDayFromExpanded(prevLastKey, expandedCumulative);
+    const dimM = utcDaysInGregorianMonth(yNum, m);
+    const lastKeyM = ymKey(yNum, m, dimM);
+    const cumEom = cumulativeNetAtEndOfDayFromExpanded(lastKeyM, expandedCumulative);
+    const monthDeltaFull = cumEom - cumBeforeMonth;
+    const pctMonthYield = formatPnlIncrementalYieldPct(monthDeltaFull, cumBeforeMonth, totalAssets);
+    const retEom = formatPnlNominalReturnPct(cumEom, totalAssets);
+    const bg = pnlCalendarCellBackground(sm, maxMonthAbs);
+    const titleY = `${yNum}年${m}月 合计 ${sm >= 0 ? '+' : ''}$${formatNumber(sm)} · 自然月收益率 ${pctMonthYield}（净变动÷(总资产−月初累计)） · 月末累计名义 ${retEom}`;
+    cells.push(`
+      <div class="pnl-cal-year-cell pnl-cal-year-cell--interactive" style="background:${bg}" role="button" tabindex="0"
+        title="${escapeHtmlAttr(`${titleY} · 点击查看当月交易`)}"
+        onclick="openTradeHistoryModalForCalendarMonth(${yNum}, ${m})"
+        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openTradeHistoryModalForCalendarMonth(${yNum}, ${m})}">
+        <div class="pnl-cal-year-mo">${m}月</div>
+        <div class="pnl-cal-year-amt">${escapeHtml(formatPnlUsdTinyOneLine(sm))}</div>
+        <div class="pnl-cal-year-pct">年 ${escapeHtml(pctMonthYield)} · 收 ${escapeHtml(retEom)}</div>
+      </div>`);
+  }
+  return `<div class="pnl-cal-year-grid">${cells.join('')}</div>`;
+}
+
+function slicePnlExpandedSeriesByQuery(
+  expanded: ReadonlyArray<{ date: string; cumulativeNet: number }>,
+  start: string,
+  end: string
+): Array<{ date: string; cumulativeNet: number }> {
+  const s = start.trim();
+  const e = end.trim();
+  if (!s && !e) {
+    return [...expanded];
+  }
+  return expanded.filter((p) => {
+    if (s && p.date < s) return false;
+    if (e && p.date > e) return false;
+    return true;
+  });
+}
+
+/** 标的是否落在「查询盈亏」起止日期内（空表示不限制该端） */
+function pnlTradeDateWithinQuery(d: string): boolean {
+  const s = state.pnlStartDate.trim();
+  const e = state.pnlEndDate.trim();
+  if (!s && !e) return true;
+  if (s && d < s) return false;
+  if (e && d > e) return false;
+  return true;
+}
+
+function pnlLineChartRangeFingerprint(series: readonly { date: string }[]): string {
+  if (series.length === 0) return '';
+  return `${series.length}\u0001${series[0].date}\u0001${series[series.length - 1].date}`;
+}
+
+function clampPnlChartViewport(vp: PnlLineChartViewport, len: number): PnlLineChartViewport {
+  if (len <= 0) return { startFloat: 0, span: 0 };
+  const minSpan = Math.min(len, PNL_LINE_CHART_MIN_POINTS);
+  let span = vp.span;
+  if (!Number.isFinite(span) || span <= 0) {
+    span = minSpan;
+  }
+  span = Math.min(Math.max(span, minSpan), len);
+
+  let startFloat = vp.startFloat;
+  if (!Number.isFinite(startFloat)) startFloat = 0;
+  const maxStart = Math.max(0, len - span);
+  startFloat = Math.min(Math.max(0, startFloat), maxStart);
+
+  return { startFloat, span };
+}
+
+function zoomPnlChartViewportWheel(
+  prev: PnlLineChartViewport,
+  len: number,
+  pivotT: number,
+  zoomOut: boolean
+): PnlLineChartViewport {
+  if (len <= PNL_LINE_CHART_MIN_POINTS) {
+    return { startFloat: 0, span: len };
+  }
+  const vp = clampPnlChartViewport(prev, len);
+  const span = vp.span;
+  const factor = zoomOut ? 1.14 : 0.87;
+  let newSpan = Math.max(PNL_LINE_CHART_MIN_POINTS, Math.round(span * factor));
+  newSpan = Math.min(len, newSpan);
+
+  const t = Math.min(1, Math.max(0, pivotT));
+  const denomOld = Math.max(1, span - 1);
+  const denomNew = Math.max(1, newSpan - 1);
+  const pivotPos = vp.startFloat + t * denomOld;
+  let newStart = pivotPos - t * denomNew;
+  const maxStart = Math.max(0, len - newSpan);
+  newStart = Math.min(Math.max(0, newStart), maxStart);
+
+  return clampPnlChartViewport({ startFloat: newStart, span: newSpan }, len);
+}
+
+function panPnlChartViewportByDx(vp: PnlLineChartViewport, len: number, dxPlotPx: number, plotWpx: number): PnlLineChartViewport {
+  if (len <= 0 || plotWpx <= 0) return vp;
+  if (len <= PNL_LINE_CHART_MIN_POINTS) {
+    return { startFloat: 0, span: len };
+  }
+  const c = clampPnlChartViewport(vp, len);
+  const deltaIdx = (-dxPlotPx / plotWpx) * c.span;
+  return clampPnlChartViewport({ startFloat: c.startFloat + deltaIdx, span: c.span }, len);
+}
+
+let pnlLineChartViewFingerprint = '';
+let pnlLineChartViewport: PnlLineChartViewport = { startFloat: 0, span: 0 };
+let pnlLineChartLastFullLen = 0;
+let pnlChartViewportRenderRaf = false;
+
+/** 与 buildPnlCumulativeLineChartSvg 中 viewBox 一致，用于屏幕像素 → 视窗数据域换算 */
+const PNL_LINE_CHART_PAD_L = 76;
+const PNL_LINE_CHART_PAD_R = 54;
+const PNL_LINE_CHART_VIEW_W = 1000;
+const PNL_LINE_CHART_INNER_W = PNL_LINE_CHART_VIEW_W - PNL_LINE_CHART_PAD_L - PNL_LINE_CHART_PAD_R;
+
+let pnlLineChartPanDragging = false;
+let pnlLineChartPanLastClientX = 0;
+let pnlLineChartPanPointerId = -1;
+
+function pnlLineChartDetachDocumentPanListeners(): void {
+  document.removeEventListener('pointermove', pnlLineChartOnDocumentPointerMove);
+  document.removeEventListener('pointerup', pnlLineChartOnDocumentPointerEnd);
+  document.removeEventListener('pointercancel', pnlLineChartOnDocumentPointerEnd);
+}
+
+function pnlLineChartOnDocumentPointerMove(ev: PointerEvent): void {
+  if (!pnlLineChartPanDragging || ev.pointerId !== pnlLineChartPanPointerId) return;
+  const dx = ev.clientX - pnlLineChartPanLastClientX;
+  pnlLineChartPanLastClientX = ev.clientX;
+  const len = pnlLineChartLastFullLen;
+  if (len <= PNL_LINE_CHART_MIN_POINTS) return;
+  const el = document.querySelector('.pnl-line-chart-svg');
+  if (!(el instanceof SVGSVGElement)) return;
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0) return;
+  const plotWpx = rect.width * (PNL_LINE_CHART_INNER_W / PNL_LINE_CHART_VIEW_W);
+  pnlLineChartViewport = panPnlChartViewportByDx(pnlLineChartViewport, len, dx, plotWpx);
+  schedulePnlChartViewportRender();
+}
+
+function pnlLineChartOnDocumentPointerEnd(ev: PointerEvent): void {
+  if (!pnlLineChartPanDragging || ev.pointerId !== pnlLineChartPanPointerId) return;
+  pnlLineChartPanDragging = false;
+  pnlLineChartPanPointerId = -1;
+  pnlLineChartDetachDocumentPanListeners();
+  const wrapEl = document.querySelector('.pnl-line-chart-wrap') as HTMLElement | null;
+  const svgEl = document.querySelector('.pnl-line-chart-svg') as SVGSVGElement | null;
+  if (wrapEl) wrapEl.style.cursor = '';
+  if (svgEl) svgEl.style.cursor = 'crosshair';
+}
+
+function schedulePnlChartViewportRender(): void {
+  if (pnlChartViewportRenderRaf) return;
+  pnlChartViewportRenderRaf = true;
+  requestAnimationFrame(() => {
+    pnlChartViewportRenderRaf = false;
+    render();
+  });
+}
+
+function resetPnlLineChartViewport(): void {
+  const len = pnlLineChartLastFullLen;
+  if (len > 0) {
+    pnlLineChartViewport = clampPnlChartViewport({ startFloat: 0, span: len }, len);
+  }
+  schedulePnlChartViewportRender();
+}
+
+function clearPnlLineChartInteractions(): void {
+  pnlLineChartHoverCleanup?.();
+  pnlLineChartHoverCleanup = null;
+}
+
+/** 无折线图可交互（切换日历/HMR 等）时释放 document 级平移监听 */
+function pnlLineChartAbortDocumentPan(): void {
+  if (!pnlLineChartPanDragging) return;
+  pnlLineChartPanDragging = false;
+  pnlLineChartPanPointerId = -1;
+  pnlLineChartDetachDocumentPanListeners();
+  const wrapEl = document.querySelector('.pnl-line-chart-wrap') as HTMLElement | null;
+  const svgEl = document.querySelector('.pnl-line-chart-svg') as SVGSVGElement | null;
+  if (wrapEl) wrapEl.style.cursor = '';
+  if (svgEl) svgEl.style.cursor = 'crosshair';
+}
+
+function setupPnlLineChartInteractions(): void {
+  clearPnlLineChartInteractions();
+  if (!pnlLineChartHoverModel || pnlLineChartHoverModel.points.length === 0) {
+    pnlLineChartAbortDocumentPan();
+    return;
+  }
+
+  const svg = document.querySelector('.pnl-line-chart-svg') as SVGSVGElement | null;
+  const wrap = document.querySelector('.pnl-line-chart-wrap') as HTMLElement | null;
+  if (!svg || !wrap) {
+    pnlLineChartAbortDocumentPan();
+    return;
+  }
+
+  let tipEl = wrap.querySelector('.pnl-line-chart-tooltip') as HTMLDivElement | null;
+  if (!tipEl) {
+    tipEl = document.createElement('div');
+    tipEl.className = 'pnl-line-chart-tooltip';
+    tipEl.setAttribute('role', 'tooltip');
+    wrap.appendChild(tipEl);
+  }
+
+  const m = pnlLineChartHoverModel;
+  const innerW = m.viewW - m.padL - m.padR;
+
+  const hideTip = (): void => {
+    if (!tipEl) return;
+    tipEl.style.opacity = '0';
+    tipEl.style.visibility = 'hidden';
+  };
+
+  const nearestIndex = (svgX: number): number => {
+    const n = m.points.length;
+    if (n <= 1) return 0;
+    const denom = Math.max(1, n - 1);
+    const step = innerW / denom;
+    const shiftPx = m.slicePanFraction * step;
+    const iFloat = (svgX - m.padL + shiftPx) / step;
+    const idx = Math.round(iFloat);
+    return Math.min(n - 1, Math.max(0, idx));
+  };
+
+  const onMove = (ev: MouseEvent): void => {
+    if (pnlLineChartPanDragging) return;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || !tipEl) return;
+    const relX = ((ev.clientX - rect.left) / rect.width) * m.viewW;
+    if (relX < m.padL || relX > m.viewW - m.padR) {
+      hideTip();
+      return;
+    }
+    const idx = nearestIndex(relX);
+    const p = m.points[idx];
+    if (!p) return;
+
+    tipEl.replaceChildren();
+    const line1 = document.createElement('div');
+    line1.className = 'pnl-line-chart-tooltip-date';
+    line1.textContent = p.date;
+    const line2 = document.createElement('div');
+    line2.className = 'pnl-line-chart-tooltip-val';
+    const strong = document.createElement('strong');
+    strong.textContent = `${p.cumulativeNet >= 0 ? '+' : ''}$${formatNumber(p.cumulativeNet)}`;
+    line2.append('累计净盈亏 ', strong);
+    tipEl.append(line1, line2);
+
+    const lineRet = document.createElement('div');
+    lineRet.className = 'pnl-line-chart-tooltip-delta';
+    lineRet.style.fontSize = '0.71rem';
+    lineRet.style.color = '#64748b';
+    lineRet.style.marginTop = '4px';
+    lineRet.textContent = `名义收益率 ${formatPnlNominalReturnPct(p.cumulativeNet, m.totalAssets)}（÷(总资产−累计)）`;
+    tipEl.appendChild(lineRet);
+
+    const dayNetVal = m.dayNetByDate.get(p.date);
+    if (dayNetVal !== undefined) {
+      const line3 = document.createElement('div');
+      line3.className = 'pnl-line-chart-tooltip-delta';
+      line3.style.fontSize = '0.71rem';
+      line3.style.color = '#64748b';
+      line3.style.marginTop = '4px';
+      line3.textContent = `当日净变动 ${dayNetVal >= 0 ? '+' : ''}$${formatNumber(dayNetVal)}`;
+      tipEl.appendChild(line3);
+    }
+
+    void tipEl.offsetWidth;
+    const wrapRect = wrap.getBoundingClientRect();
+    const lx = ev.clientX - wrapRect.left;
+    const ly = ev.clientY - wrapRect.top;
+    const tw = tipEl.offsetWidth;
+    tipEl.style.left = `${Math.min(Math.max(8, lx - tw / 2), Math.max(8, wrap.clientWidth - tw - 8))}px`;
+    tipEl.style.top = `${Math.max(8, ly - 54)}px`;
+    tipEl.style.opacity = '1';
+    tipEl.style.visibility = 'visible';
+  };
+
+  const onLeave = (): void => {
+    if (pnlLineChartPanDragging) return;
+    hideTip();
+  };
+
+  const onWheel = (ev: WheelEvent): void => {
+    if (m.fullSeriesLength <= PNL_LINE_CHART_MIN_POINTS) return;
+    ev.preventDefault();
+    const wrapRect = wrap.getBoundingClientRect();
+    if (wrapRect.width <= 0) return;
+    const relX = ((ev.clientX - wrapRect.left) / wrapRect.width) * m.viewW;
+    const clampedRelX = Math.min(m.viewW - m.padR, Math.max(m.padL, relX));
+    const pivotT = (clampedRelX - m.padL) / innerW;
+    const zoomOut = ev.deltaY > 0;
+    pnlLineChartViewport = zoomPnlChartViewportWheel(
+      pnlLineChartViewport,
+      m.fullSeriesLength,
+      pivotT,
+      zoomOut
+    );
+    schedulePnlChartViewportRender();
+    hideTip();
+  };
+
+  const onPointerDown = (ev: PointerEvent): void => {
+    if (ev.button !== 0) return;
+    if (m.fullSeriesLength <= PNL_LINE_CHART_MIN_POINTS) return;
+    const t = ev.target;
+    if (t instanceof Element && t.closest('button')) {
+      return;
+    }
+    const rect0 = svg.getBoundingClientRect();
+    if (rect0.width <= 0) return;
+    ev.preventDefault();
+    pnlLineChartPanDragging = true;
+    pnlLineChartPanLastClientX = ev.clientX;
+    pnlLineChartPanPointerId = ev.pointerId;
+    hideTip();
+    wrap.style.cursor = 'grabbing';
+    svg.style.cursor = 'grabbing';
+    document.addEventListener('pointermove', pnlLineChartOnDocumentPointerMove);
+    document.addEventListener('pointerup', pnlLineChartOnDocumentPointerEnd);
+    document.addEventListener('pointercancel', pnlLineChartOnDocumentPointerEnd);
+  };
+
+  const onDblClick = (ev: MouseEvent): void => {
+    ev.preventDefault();
+    resetPnlLineChartViewport();
+  };
+
+  svg.addEventListener('mousemove', onMove);
+  svg.addEventListener('mouseleave', onLeave);
+  wrap.addEventListener('wheel', onWheel, { passive: false });
+  wrap.addEventListener('pointerdown', onPointerDown);
+  wrap.addEventListener('dblclick', onDblClick);
+
+  pnlLineChartHoverCleanup = (): void => {
+    svg.removeEventListener('mousemove', onMove);
+    svg.removeEventListener('mouseleave', onLeave);
+    wrap.removeEventListener('wheel', onWheel);
+    wrap.removeEventListener('pointerdown', onPointerDown);
+    wrap.removeEventListener('dblclick', onDblClick);
+    wrap.style.cursor = '';
+    svg.style.cursor = '';
+  };
+}
+
+function pnlCalendarCellBackground(dayNet: number, maxAbs: number): string {
+  if (dayNet === 0) return '#f1f5f9';
+  const t = maxAbs > 0 ? Math.min(1, Math.abs(dayNet) / maxAbs) : 1;
+  const bump = Math.round((0.18 + 0.62 * t) * 1000) / 1000;
+  return dayNet > 0 ? `rgba(16,185,129,${bump})` : `rgba(239,68,68,${bump})`;
+}
+
+function buildPnlCumulativeLineChartSvg(
+  points: ReadonlyArray<{ date: string; cumulativeNet: number }>,
+  gradientId: string,
+  hintLine: string,
+  panFractionInCell: number,
+  clipId: string,
+  totalAssets: number
+): string {
+  const w = PNL_LINE_CHART_VIEW_W;
+  const h = 220;
+  const padL = PNL_LINE_CHART_PAD_L;
+  const padR = PNL_LINE_CHART_PAD_R;
+  const padT = 14;
+  const padB = 48;
+  const vals = points.map((p) => p.cumulativeNet);
+  const minV = Math.min(0, ...vals);
+  const maxV = Math.max(0, ...vals);
+  const vSpan = maxV - minV || 1;
+  const n = points.length;
+  const innerW = w - padL - padR;
+  const innerH = h - padT - padB;
+  const panF = Math.min(1, Math.max(0, panFractionInCell));
+  const denom = n <= 1 ? 1 : n - 1;
+  const stepPx = n <= 1 ? innerW / 2 : innerW / denom;
+  const shiftPx = n <= 1 ? 0 : panF * stepPx;
+  const xs = points.map((_, i) => padL + (n <= 1 ? innerW / 2 : (i / denom) * innerW) - shiftPx);
+  const ys = points.map((p) => padT + innerH - ((p.cumulativeNet - minV) / vSpan) * innerH);
+  const linePtsStr = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
+  const lastY = ys[ys.length - 1] ?? padT + innerH / 2;
+  const lastX = xs[xs.length - 1] ?? padL + innerW / 2;
+  const firstX = xs[0] ?? padL;
+
+  let zeroLine = '';
+  if (minV < 0 && maxV > 0) {
+    const zy = padT + innerH - ((0 - minV) / vSpan) * innerH;
+    zeroLine = `<line x1="${padL}" y1="${zy.toFixed(1)}" x2="${padL + innerW}" y2="${zy.toFixed(1)}" stroke="#cbd5e1" stroke-dasharray="4 4" stroke-width="1" />`;
+  }
+
+  const yTop = `${formatNumber(maxV)}`;
+  const yBot = `${formatNumber(minV)}`;
+  const yMidVal = minV + vSpan / 2;
+  const yMid = `${formatNumber(yMidVal)}`;
+
+  const rTop = formatPnlNominalReturnPct(maxV, totalAssets);
+  const rMid = formatPnlNominalReturnPct(yMidVal, totalAssets);
+  const rBot = formatPnlNominalReturnPct(minV, totalAssets);
+  const rZero =
+    minV < 0 && maxV > 0 ? formatPnlNominalReturnPct(0, totalAssets) : '';
+
+  const areaPts = `${firstX.toFixed(1)},${(padT + innerH).toFixed(1)} ${linePtsStr} ${lastX.toFixed(1)},${(padT + innerH).toFixed(1)}`;
+
+  const firstLbl = points[0].date.slice(5).replace(/^(\d{2})-(\d{2})$/, '$1/$2');
+  const lastLbl = points[points.length - 1].date.slice(5).replace(/^(\d{2})-(\d{2})$/, '$1/$2');
+  const gid = escapeHtmlAttr(gradientId);
+  const cid = escapeHtmlAttr(clipId);
+
+  return `
+    <div class="pnl-line-chart-wrap">
+      <svg class="pnl-line-chart-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" aria-label="累计净盈亏折线">
+        <defs>
+          <linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#6366f1" stop-opacity="0.22" />
+            <stop offset="100%" stop-color="#6366f1" stop-opacity="0.02" />
+          </linearGradient>
+          <clipPath id="${cid}">
+            <rect x="${padL}" y="${padT}" width="${innerW}" height="${innerH}" />
+          </clipPath>
+        </defs>
+        <text x="${padL - 4}" y="${padT + 12}" text-anchor="end" font-size="12" fill="#64748b">$${escapeHtml(yTop)}</text>
+        <text x="${padL - 4}" y="${padT + innerH / 2 + 4}" text-anchor="end" font-size="12" fill="#64748b">$${escapeHtml(yMid)}</text>
+        <text x="${padL - 4}" y="${padT + innerH + 2}" text-anchor="end" font-size="12" fill="#64748b">$${escapeHtml(yBot)}</text>
+        <text x="${w - 4}" y="${padT + 12}" text-anchor="end" font-size="11" fill="#94a3b8">${escapeHtml(rTop)}</text>
+        <text x="${w - 4}" y="${padT + innerH / 2 + 4}" text-anchor="end" font-size="11" fill="#94a3b8">${escapeHtml(rMid)}</text>
+        <text x="${w - 4}" y="${padT + innerH + 2}" text-anchor="end" font-size="11" fill="#94a3b8">${escapeHtml(rBot)}</text>
+        ${
+          rZero && minV < 0 && maxV > 0
+            ? `<text x="${w - 4}" y="${(
+                padT + innerH - ((0 - minV) / vSpan) * innerH +
+                4
+              ).toFixed(1)}" text-anchor="end" font-size="10" fill="#94a3b8">${escapeHtml(rZero)}</text>`
+            : ''
+        }
+        <g clip-path="url(#${cid})">
+        ${zeroLine}
+        <polygon points="${areaPts}" fill="url(#${gid})" stroke="none" />
+        <polyline points="${linePtsStr}" fill="none" stroke="#4f46e5" stroke-width="2.25" stroke-linejoin="round" stroke-linecap="round" />
+        <circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="4.5" fill="#4f46e5" stroke="white" stroke-width="1.5" />
+        </g>
+        <text x="${padL}" y="${h - 10}" font-size="11" fill="#64748b">${escapeHtml(firstLbl)}</text>
+        <text x="${padL + innerW}" y="${h - 10}" font-size="11" fill="#64748b" text-anchor="end">${escapeHtml(lastLbl)}</text>
+      </svg>
+      <div class="pnl-line-chart-hint-row">
+        <span class="pnl-line-chart-hint-text">${escapeHtml(hintLine)}</span>
+        <button type="button" class="btn btn-secondary pnl-line-chart-reset-btn" onclick="resetPnlLineChartViewport()">
+          复位视窗
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderPnlCumulativeVisualization(): string {
+  pnlLineChartHoverModel = null;
+
+  if (state.trades.length === 0) return '';
+
+  const sparse = buildDailyCumulativeNetPnlSeries(state.trades);
+  if (sparse.length === 0) return '';
+
+  const expanded = expandCumulativeDailyToAllDays(sparse);
+  const rangeSlice = slicePnlExpandedSeriesByQuery(expanded, state.pnlStartDate, state.pnlEndDate);
+  const dayNetByDate = new Map(sparse.map((p) => [p.date, p.dayNet]));
+  const lastCumFull = sparse[sparse.length - 1].cumulativeNet;
+  const hasQueryRange = state.pnlStartDate.trim() !== '' || state.pnlEndDate.trim() !== '';
+  const pnlDashboardTotalAssets = state.totalValue + state.cash;
+
+  const { y: dispY, m: dispM } = effectiveYmPartsNow();
+  const yBounds = sparseTradeYearBounds(sparse);
+  const yEffYear = effectiveCalendarYearForYearView();
+  const cy = new Date().getFullYear();
+  let minYo = Math.min(yBounds.minY, dispY, yEffYear, cy);
+  let maxYo = Math.max(yBounds.maxY, dispY, yEffYear, cy);
+  let yearDropdownOpts = '';
+  for (let oy = minYo; oy <= maxYo; oy++) {
+    yearDropdownOpts += `<option value="${oy}" ${oy === dispY ? 'selected' : ''}>${escapeHtml(String(oy))} 年</option>`;
+  }
+  let monthDropdownOpts = '';
+  for (let mo = 1; mo <= 12; mo++) {
+    monthDropdownOpts += `<option value="${mo}" ${mo === dispM ? 'selected' : ''}>${mo} 月</option>`;
+  }
+  let yearGridDropdownOpts = '';
+  for (let oy = minYo; oy <= maxYo; oy++) {
+    yearGridDropdownOpts += `<option value="${oy}" ${oy === yEffYear ? 'selected' : ''}>${escapeHtml(String(oy))} 年</option>`;
+  }
+
+  const calMonthInner = buildPnlMonthCalendarGridInner(
+    dispY,
+    dispM,
+    dayNetByDate,
+    expanded,
+    pnlDashboardTotalAssets
+  );
+  const calYearInner = buildPnlYearCalendarInner(
+    yEffYear,
+    dayNetByDate,
+    expanded,
+    pnlDashboardTotalAssets
+  );
+
+  const isLine = pnlVizMode === 'line';
+
+  let lineSvgHtml = '';
+  if (isLine) {
+    if (rangeSlice.length === 0) {
+      lineSvgHtml =
+        '<div class="pnl-line-chart-empty">当前「查询盈亏」所选时间段与有数据的日期区间无交集，折线无法绘制。请调整起止日期或点击「重置」。</div>';
+    } else {
+      const nFull = rangeSlice.length;
+      const fp = pnlLineChartRangeFingerprint(rangeSlice);
+      if (fp !== pnlLineChartViewFingerprint) {
+        pnlLineChartViewFingerprint = fp;
+        pnlLineChartViewport = clampPnlChartViewport({ startFloat: 0, span: nFull }, nFull);
+      }
+      pnlLineChartLastFullLen = nFull;
+      pnlLineChartViewport = clampPnlChartViewport(pnlLineChartViewport, nFull);
+      const vpC = pnlLineChartViewport;
+      const i0 = Math.floor(vpC.startFloat);
+      const slicePanFraction = vpC.startFloat - i0;
+      const viewPoints = rangeSlice.slice(i0, i0 + vpC.span);
+      if (viewPoints.length === 0) {
+        lineSvgHtml =
+          '<div class="pnl-line-chart-empty">视窗为空，请点击「复位视窗」或刷新页面。</div>';
+      } else {
+        const v0 = viewPoints[0];
+        const v1 = viewPoints[viewPoints.length - 1];
+        const hintShort =
+          viewPoints.length >= 1 && v0 && v1
+            ? `视窗 ${v0.date}～${v1.date}（${viewPoints.length}/${nFull} 日）· 整块区域滚轮缩放 · 左键拖拽平移 · 双击或「复位」恢复全宽`
+            : '';
+        pnlLineChartGradientSeq += 1;
+        const gid = `pnlGrad${pnlLineChartGradientSeq}`;
+        const cid = `pnlClip${pnlLineChartGradientSeq}`;
+        lineSvgHtml = buildPnlCumulativeLineChartSvg(
+          viewPoints,
+          gid,
+          hintShort,
+          slicePanFraction,
+          cid,
+          pnlDashboardTotalAssets
+        );
+        pnlLineChartHoverModel = {
+          points: viewPoints,
+          fullSeriesLength: nFull,
+          slicePanFraction,
+          dayNetByDate,
+          totalAssets: pnlDashboardTotalAssets,
+          viewW: PNL_LINE_CHART_VIEW_W,
+          viewH: 220,
+          padL: PNL_LINE_CHART_PAD_L,
+          padR: PNL_LINE_CHART_PAD_R,
+          padT: 14,
+          padB: 48
+        };
+      }
+    }
+  }
+
+  const cumLabel = hasQueryRange ? '查询区间期末累计净盈亏' : '当前累计净盈亏';
+  const cumValueEnd = rangeSlice.length > 0 ? rangeSlice[rangeSlice.length - 1].cumulativeNet : null;
+  const cumBadge =
+    cumValueEnd === null
+      ? `<span style="color: #94a3b8;">—</span>`
+      : `<strong style="color: ${cumValueEnd >= 0 ? '#059669' : '#dc2626'};">${cumValueEnd >= 0 ? '+' : ''}$${formatNumber(
+          cumValueEnd
+        )}</strong>`;
+
+  const fmtLastAll = `$${formatNumber(lastCumFull)}`;
+
+  /** 日历粒度行右侧：所选自然月/自然年末累计；区间净盈亏及占末日累计比例（仅日历内展示一处） */
+  let pnlCalPeriodSummaryHtml = '';
+  if (!isLine) {
+    if (pnlCalendarGranularity === 'month') {
+      const pkBefore = lastGregorianCalendarKeyStrictlyBeforeMonth(dispY, dispM);
+      const cumBeforeMo = cumulativeNetAtEndOfDayFromExpanded(pkBefore, expanded);
+      const dimMS = utcDaysInGregorianMonth(dispY, dispM);
+      const lastMoKey = ymKey(dispY, dispM, dimMS);
+      const cumMoEnd = cumulativeNetAtEndOfDayFromExpanded(lastMoKey, expanded);
+      const deltaMo = cumMoEnd - cumBeforeMo;
+      const pctShare = formatPnlPeriodDeltaVsLifetimePct(deltaMo, lastCumFull);
+      const moCol = cumMoEnd >= 0 ? '#059669' : '#dc2626';
+      const deltaCol = deltaMo >= 0 ? '#059669' : '#dc2626';
+      pnlCalPeriodSummaryHtml = `<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 2px;">
+        <span style="font-size: 0.75rem;">
+          <span style="color: #94a3b8;">截至 ${dispY}年${dispM}月末 累计净盈亏</span>
+          <strong style="color: ${moCol}; margin-left: 4px;">${cumMoEnd >= 0 ? '+' : ''}$${formatNumber(cumMoEnd)}</strong>
+        </span>
+        <span style="font-size: 0.72rem; color: #94a3b8;">
+          ${dispY}年${dispM}月 净盈亏 <strong style="color: ${deltaCol};">${deltaMo >= 0 ? '+' : ''}$${formatNumber(deltaMo)}</strong>
+          <span style="margin-left: 6px;">占全历史末日累计</span> <strong style="color: #475569;">${pctShare}</strong>
+        </span>
+      </div>`;
+    } else {
+      const pkBeforeYear = lastGregorianCalendarKeyStrictlyBeforeMonth(yEffYear, 1);
+      const cumBeforeY = cumulativeNetAtEndOfDayFromExpanded(pkBeforeYear, expanded);
+      const dimDec = utcDaysInGregorianMonth(yEffYear, 12);
+      const lastYearKey = ymKey(yEffYear, 12, dimDec);
+      const cumYeEnd = cumulativeNetAtEndOfDayFromExpanded(lastYearKey, expanded);
+      const deltaY = cumYeEnd - cumBeforeY;
+      const pctShareY = formatPnlPeriodDeltaVsLifetimePct(deltaY, lastCumFull);
+      const yrCol = cumYeEnd >= 0 ? '#059669' : '#dc2626';
+      const deltaYCol = deltaY >= 0 ? '#059669' : '#dc2626';
+      pnlCalPeriodSummaryHtml = `<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 2px;">
+        <span style="font-size: 0.75rem;">
+          <span style="color: #94a3b8;">截至 ${yEffYear}年末 累计净盈亏</span>
+          <strong style="color: ${yrCol}; margin-left: 4px;">${cumYeEnd >= 0 ? '+' : ''}$${formatNumber(cumYeEnd)}</strong>
+        </span>
+        <span style="font-size: 0.72rem; color: #94a3b8;">
+          ${yEffYear}年 净盈亏 <strong style="color: ${deltaYCol};">${deltaY >= 0 ? '+' : ''}$${formatNumber(deltaY)}</strong>
+          <span style="margin-left: 6px;">占全历史末日累计</span> <strong style="color: #475569;">${pctShareY}</strong>
+        </span>
+      </div>`;
+    }
+  }
+
+  const rangeExplain = hasQueryRange
+    ? `折线横轴为上方「查询盈亏」起止日与有数据自然日的交集；左侧纵轴为当日结束时的<strong>累计净盈亏</strong>（与全历史末日累计 ${fmtLastAll} 同源，仅裁剪横轴）；右侧灰白色刻度为对应<strong>名义收益率</strong>：累计净盈亏÷(当前<strong>总资产</strong>−累计净盈亏)，总资产为看板「持仓市值+现金」。折线区可滚轮缩放、拖拽平移；悬停可看金额与收益率。日历：<strong>「月 x%」</strong>（月粒度）为<strong>当日</strong>变动收益率；<strong>「年 x%」</strong>（年粒度各月格）为该<strong>公历自然月</strong>变动收益率；均为净变动÷(总资产−变动前累计)；<strong>「收」</strong>为<strong>累计</strong>名义收益率（累计÷(总资产−累计)）。`
+    : `未设置查询时间段时，折线横轴为首笔至末笔的每个自然日；左轴<strong>累计净盈亏</strong>为 FIFO 已实现（期权 ×100）减累计手续费，再加<strong>其它收支毛额</strong>（利息/分红等）；右轴名义收益率=累计÷(看板<strong>总资产</strong>−累计)。日历「月/年 x%」为<strong>变动收益率</strong>（净变动÷(总资产−变动前累计)）；「收」为累计名义收益率，口径同上。`;
+
+  return `
+    <div class="pnl-cumulative-viz" style="margin-top: 18px; padding-top: 16px; border-top: 1px solid #e2e8f0;">
+      <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;">
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+          <span style="font-size: 0.85rem; font-weight: 600; color: #334155;">累计盈亏</span>
+          <div style="display: inline-flex; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+            <button type="button" onclick="setPnlVizMode('line')"
+              style="border: none; padding: 6px 14px; font-size: 0.82rem; cursor: pointer; ${
+                isLine ? 'background: #eef2ff; color: #4338ca; font-weight: 600;' : 'background: white; color: #64748b;'
+              }">折线</button>
+            <button type="button" onclick="setPnlVizMode('calendar')"
+              style="border: none; padding: 6px 14px; font-size: 0.82rem; cursor: pointer; border-left: 1px solid #e2e8f0; ${
+                !isLine ? 'background: #eef2ff; color: #4338ca; font-weight: 600;' : 'background: white; color: #64748b;'
+              }">日历</button>
+          </div>
+        </div>
+        <span style="font-size: 0.75rem; color: #64748b;">${cumLabel} ${cumBadge}</span>
+      </div>
+      <p style="margin: 8px 0 0 0; font-size: 0.72rem; color: #94a3b8; line-height: 1.45;">
+        ${rangeExplain}
+      </p>
+      ${
+        isLine
+          ? lineSvgHtml
+          : `
+        <div class="pnl-calendar-block" style="margin-top: 12px;">
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; justify-content: space-between; margin-bottom: 12px;">
+            <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+            <span style="font-size: 0.82rem; color: #64748b;">粒度</span>
+            <div style="display: inline-flex; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+              <button type="button" onclick="setPnlCalendarGranularity('month')"
+                style="border: none; padding: 6px 12px; font-size: 0.8rem; cursor: pointer; ${
+                  pnlCalendarGranularity === 'month'
+                    ? 'background: #eef2ff; color: #4338ca; font-weight: 600;'
+                    : 'background: white; color: #64748b;'
+                }">按月</button>
+              <button type="button" onclick="setPnlCalendarGranularity('year')"
+                style="border: none; padding: 6px 12px; font-size: 0.8rem; cursor: pointer; border-left: 1px solid #e2e8f0; ${
+                  pnlCalendarGranularity === 'year'
+                    ? 'background: #eef2ff; color: #4338ca; font-weight: 600;'
+                    : 'background: white; color: #64748b;'
+                }">按年</button>
+            </div>
+            </div>
+            ${pnlCalPeriodSummaryHtml}
+          </div>
+          ${
+            pnlCalendarGranularity === 'month'
+              ? `
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px;">
+            <button type="button" class="btn btn-secondary" onclick="shiftPnlCalendarMonth(-1)" style="padding: 4px 10px; font-size: 0.8rem;">上月</button>
+            <button type="button" class="btn btn-secondary" onclick="shiftPnlCalendarMonth(1)" style="padding: 4px 10px; font-size: 0.8rem;">下月</button>
+            <label style="font-size: 0.82rem; color: #475569;">年
+              <select id="pnl-cal-year-sel" onchange="setPnlCalendarYmFromDom()" style="margin-left: 6px; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;">
+                ${yearDropdownOpts}
+              </select>
+            </label>
+            <label style="font-size: 0.82rem; color: #475569;">月
+              <select id="pnl-cal-month-sel" onchange="setPnlCalendarYmFromDom()" style="margin-left: 6px; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;">
+                ${monthDropdownOpts}
+              </select>
+            </label>
+            <button type="button" class="btn btn-secondary" onclick="resetPnlCalendarMonth()" style="padding: 4px 10px; font-size: 0.8rem; color: #64748b;">重置到本月</button>
+          </div>
+          <div class="pnl-cal-weekdays" aria-hidden="true">
+            <span>周一</span><span>周二</span><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>周日</span>
+          </div>
+          <div class="pnl-cal-grid">${calMonthInner}</div>
+          <div class="pnl-cal-legend" style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 0.7rem; color: #94a3b8;">
+            <span>首行数字为日；第二行为当日盈亏（有成交日）；「月 x%」= 当日<strong>变动收益率</strong>；「收」= 日终<strong>累计</strong>名义收益率。<strong>点击日期格</strong>可打开交易记录（已按该日筛选）。</span>
+          </div>
+          `
+              : `
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px;">
+            <button type="button" class="btn btn-secondary" onclick="shiftPnlCalendarYearFocus(-1)" style="padding: 4px 10px; font-size: 0.8rem;">上一年</button>
+            <button type="button" class="btn btn-secondary" onclick="shiftPnlCalendarYearFocus(1)" style="padding: 4px 10px; font-size: 0.8rem;">下一年</button>
+            <label style="font-size: 0.82rem; color: #475569;">年份
+              <select id="pnl-cal-year-grid-sel" onchange="setPnlCalendarYearFocusOnlyFromDom()" style="margin-left: 6px; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;">
+                ${yearGridDropdownOpts}
+              </select>
+            </label>
+          </div>
+          ${calYearInner}
+          <div class="pnl-cal-legend" style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 0.7rem; color: #94a3b8;">
+            <span>各格金额为当月<strong>查询范围内</strong>净变动合计（着色）；「年 x%」为该<strong>公历自然月整月</strong>的变动收益率；「收」= 该月末累计名义收益率。<strong>点击月格</strong>可打开交易记录（已按该自然月筛选）。</span>
+          </div>
+          `
+          }
+        </div>
+      `
+      }
+    </div>
+  `;
 }
 
 function exportToJSON(): void {
@@ -1731,6 +3042,36 @@ function normalizeImportedTrades(arr: unknown[]): TradeRecord[] {
     if (!item || typeof item !== 'object') continue;
     const o = item as Record<string, unknown>;
     const id = String(o.id ?? crypto.randomUUID());
+    const typRaw = String(o.type ?? '').toLowerCase();
+    const isOther =
+      typRaw === 'other' ||
+      typRaw === '其它' ||
+      (typeof o.type === 'string' && o.type === '其它');
+    const typeZh = typeof o.type === 'string' ? o.type : '';
+    if (isOther || typeZh === '其它') {
+      let symbol = String(o.symbol ?? '').trim().toUpperCase();
+      if (!symbol) symbol = 'OTHER';
+      const cat = String(o.other_category ?? o.otherCategory ?? '').trim();
+      if (!cat) continue;
+      const totalRaw = Number(o.total_amount);
+      if (!Number.isFinite(totalRaw) || totalRaw === 0) continue;
+      const commission = Number.isFinite(Number(o.commission)) ? Number(o.commission) : 0;
+      out.push({
+        id,
+        symbol,
+        name: String(o.name ?? cat),
+        type: 'other',
+        other_category: cat,
+        shares: 1,
+        price: 0,
+        total_amount: totalRaw,
+        commission,
+        trade_date: parseImportedTradeDatetime(o.trade_date),
+        created_at: String(o.created_at ?? new Date().toISOString())
+      });
+      continue;
+    }
+
     const symbol = String(o.symbol ?? '').trim().toUpperCase();
     if (!symbol) continue;
     const shares = Number(o.shares);
@@ -1751,7 +3092,7 @@ function normalizeImportedTrades(arr: unknown[]): TradeRecord[] {
           ? totalRaw
           : shares * price * (isOptionSymbol(symbol) ? 100 : 1),
       commission,
-      trade_date: String(o.trade_date ?? new Date().toISOString()),
+      trade_date: parseImportedTradeDatetime(o.trade_date),
       created_at: String(o.created_at ?? new Date().toISOString())
     });
   }
@@ -2040,6 +3381,9 @@ function renderTradePanel(): string {
         <button type="button" class="btn btn-secondary" onclick="openNewTradeForm('sell')" style="padding: 8px 16px; font-size: 0.85rem; border: 1px solid #fecaca; color: #b91c1c; background: #fef2f2;">
           ＋ 新增卖出
         </button>
+        <button type="button" class="btn btn-secondary" onclick="openOtherTradeModal()" style="padding: 8px 16px; font-size: 0.85rem; border: 1px solid #c7d2fe; color: #4338ca; background: #eef2ff;">
+          ＋ 其它收支
+        </button>
         <button class="btn btn-secondary" onclick="openTradeHistoryModal()" style="padding: 8px 16px; font-size: 0.85rem;">
           📋 交易记录 (${state.trades.length})
         </button>
@@ -2047,6 +3391,7 @@ function renderTradePanel(): string {
           <div style="display: flex; gap: 12px; padding: 8px 16px; background: linear-gradient(135deg, #1e293b 0%, #334155 100%); border-radius: 8px; color: white; font-size: 0.85rem;">
             <span>已实现盈亏: <strong style="color: ${state.pnlStats.realizedPL >= 0 ? '#4ade80' : '#f87171'};">$${formatNumber(state.pnlStats.realizedPL)}</strong></span>
             <span>手续费: <strong>$${formatNumber(state.pnlStats.commission)}</strong></span>
+            <span>其它收支(毛额): <strong style="color: ${state.pnlStats.otherAmount >= 0 ? '#93c5fd' : '#fca5a5'};">${state.pnlStats.otherAmount >= 0 ? '+' : ''}$${formatNumber(state.pnlStats.otherAmount)}</strong></span>
             <span>净盈亏: <strong style="color: ${state.pnlStats.netPL >= 0 ? '#4ade80' : '#f87171'};">$${formatNumber(state.pnlStats.netPL)}</strong></span>
           </div>
         ` : ''}
@@ -2089,6 +3434,12 @@ function renderTradePanel(): string {
             <div style="font-size: 0.75rem; color: #64748b;">手续费</div>
             <div style="font-size: 1.1rem; font-weight: 600; color: #ef4444;">-$${formatNumber(state.pnlStats.commission)}</div>
           </div>
+          <div style="padding: 12px; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+            <div style="font-size: 0.75rem; color: #64748b;">其它收支（毛额）</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: ${state.pnlStats.otherAmount >= 0 ? '#10b981' : '#ef4444'};">
+              ${state.pnlStats.otherAmount >= 0 ? '+' : ''}$${formatNumber(state.pnlStats.otherAmount)}
+            </div>
+          </div>
           <div style="padding: 12px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 6px; color: white;">
             <div style="font-size: 0.75rem; opacity: 0.9;">净盈亏</div>
             <div style="font-size: 1.2rem; font-weight: 700;">
@@ -2099,6 +3450,7 @@ function renderTradePanel(): string {
       ` : `
         <div style="color: #94a3b8; font-size: 0.85rem;">点击「查询」查看盈亏统计</div>
       `}
+      ${renderPnlCumulativeVisualization()}
     </div>
     </div>
   `;
@@ -2111,10 +3463,83 @@ function openTradeHistoryModal(): void {
   render();
 }
 
+/** 从持仓行打开：按标的筛选，列表按日期倒序，首页即最近成交 */
+function openTradeHistoryModalForSymbol(symbol: string): void {
+  const s = symbol.trim();
+  if (!s) return;
+  tradeHistoryModalOpen = true;
+  tradeHistoryFilter = { symbol: s, type: '', otherCategory: '', startDate: '', endDate: '' };
+  tradeHistoryPage = 1;
+  render();
+}
+
+/** 日历月视图：某日 yyyy-mm-dd 的成交 */
+function openTradeHistoryModalForCalendarDay(isoDate: string): void {
+  const d = isoDate.trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+  tradeHistoryModalOpen = true;
+  tradeHistoryFilter = { symbol: '', type: '', otherCategory: '', startDate: d, endDate: d };
+  tradeHistoryPage = 1;
+  render();
+}
+
+/** 日历年视图：公历整月 [start,end]  inclusive */
+function openTradeHistoryModalForCalendarMonth(y: number, mo: number): void {
+  const yi = Math.trunc(y);
+  const moi = Math.trunc(mo);
+  if (!Number.isFinite(yi) || !Number.isFinite(moi) || moi < 1 || moi > 12) return;
+  const dim = utcDaysInGregorianMonth(yi, moi);
+  const start = ymKey(yi, moi, 1);
+  const end = ymKey(yi, moi, dim);
+  tradeHistoryModalOpen = true;
+  tradeHistoryFilter = { symbol: '', type: '', otherCategory: '', startDate: start, endDate: end };
+  tradeHistoryPage = 1;
+  render();
+}
+
 // 关闭交易记录弹窗
 function closeTradeHistoryModal(): void {
   tradeHistoryModalOpen = false;
   render();
+}
+
+/**
+ * 遮罩关闭：仅在按下与释放在同一遮罩层上时关闭（从内层拖出到遮罩外释放不会误关）。
+ * 若用 `click`，在内容区按下拖到遮罩释放会合成对遮罩的一次 click。
+ */
+type ModalBackdropKind = 'tradeHistory' | 'otherTrade' | 'importTrade' | 'editTrade' | 'tradeForm';
+
+let modalBackdropPointerDown: ModalBackdropKind | null = null;
+
+function onModalBackdropMouseDown(event: MouseEvent, kind: ModalBackdropKind): void {
+  if (event.target !== event.currentTarget) return;
+  modalBackdropPointerDown = kind;
+}
+
+function onModalBackdropMouseUp(event: MouseEvent, kind: ModalBackdropKind): void {
+  const armed = modalBackdropPointerDown;
+  modalBackdropPointerDown = null;
+  if (armed !== kind) return;
+  if (event.target !== event.currentTarget) return;
+  switch (kind) {
+    case 'tradeHistory':
+      closeTradeHistoryModal();
+      break;
+    case 'otherTrade':
+      closeOtherTradeModal();
+      break;
+    case 'importTrade':
+      closeImportTradeModal();
+      break;
+    case 'editTrade':
+      closeEditTradeModal();
+      break;
+    case 'tradeForm':
+      closeTradeForm();
+      break;
+    default:
+      break;
+  }
 }
 
 // 筛选（交易记录始终在本地 state.trades，此处仅重绘弹窗）
@@ -2123,14 +3548,17 @@ function loadTradesFiltered(): void {
 }
 
 // 设置筛选条件
-function setTradeHistoryFilter(field: 'symbol' | 'type' | 'startDate' | 'endDate', value: string): void {
+function setTradeHistoryFilter(
+  field: 'symbol' | 'type' | 'otherCategory' | 'startDate' | 'endDate',
+  value: string
+): void {
   if (field === 'type') {
-    tradeHistoryFilter.type = value as '' | 'buy' | 'sell';
+    tradeHistoryFilter.type = value as '' | 'buy' | 'sell' | 'other';
   } else {
     (tradeHistoryFilter as Record<string, string>)[field] = value;
   }
   tradeHistoryPage = 1;
-  if (field === 'symbol') {
+  if (field === 'symbol' || field === 'otherCategory') {
     patchTradeHistoryModalTableRoot();
     return;
   }
@@ -2139,7 +3567,7 @@ function setTradeHistoryFilter(field: 'symbol' | 'type' | 'startDate' | 'endDate
 
 // 重置筛选
 function resetTradeHistoryFilter(): void {
-  tradeHistoryFilter = { symbol: '', type: '', startDate: '', endDate: '' };
+  tradeHistoryFilter = { symbol: '', type: '', otherCategory: '', startDate: '', endDate: '' };
   tradeHistoryPage = 1;
   loadTradesFiltered();
 }
@@ -2166,6 +3594,14 @@ function getTradeHistoryFilteredTrades(): TradeRecord[] {
   }
   if (tradeHistoryFilter.type) {
     filtered = filtered.filter(t => t.type === tradeHistoryFilter.type);
+  }
+  const catNeedle = tradeHistoryFilter.otherCategory.trim().toLowerCase();
+  if (catNeedle) {
+    filtered = filtered.filter((t) => {
+      if (t.type !== 'other') return false;
+      const c = (t.other_category ?? '').trim().toLowerCase();
+      return c.includes(catNeedle);
+    });
   }
   if (tradeHistoryFilter.startDate) {
     filtered = filtered.filter(
@@ -2208,32 +3644,58 @@ function buildTradeHistoryModalTableRootInnerHtml(): string {
               minute: '2-digit'
             });
             const isBuy = trade.type === 'buy';
+            const isOther = trade.type === 'other';
+            const amtCol = isOther
+              ? trade.total_amount >= 0
+                ? '#10b981'
+                : '#ef4444'
+              : isBuy
+                ? '#334155'
+                : '#10b981';
+            const amtPrefix = isOther
+              ? trade.total_amount >= 0
+                ? '+'
+                : '-'
+              : isBuy
+                ? '-'
+                : '+';
+            const typeLabel = isOther
+              ? escapeHtml(trade.other_category ?? '其它')
+              : isBuy
+                ? '买入'
+                : '卖出';
+            const typeBg = isOther ? '#6366f1' : isBuy ? '#10b981' : '#ef4444';
+            const sharesCell = isOther ? '—' : `${formatNumber(trade.shares)} 股`;
+            const priceCell = isOther ? '—' : `@ $${formatNumber(trade.price)}`;
+            const nameCell = escapeHtml(
+              isOther ? (trade.name || trade.other_category || trade.symbol) : trade.name
+            );
 
             return `
       <tr style="border-bottom: 1px solid #e2e8f0;">
         <td style="padding: 12px; color: #64748b; font-size: 0.85rem;">${date}<br/><span style="font-size: 0.75rem;">${time}</span></td>
         <td style="padding: 12px;">
-          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 10px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">
-            ${isBuy ? '买入' : '卖出'}
+          <span style="background: ${typeBg}; color: white; padding: 2px 10px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">
+            ${typeLabel}
           </span>
         </td>
-        <td style="padding: 12px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
-        <td style="padding: 12px; color: #334155; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${trade.name}</td>
-        <td style="padding: 12px; text-align: right; font-weight: 600;">${formatNumber(trade.shares)} 股</td>
-        <td style="padding: 12px; text-align: right;">@ $${formatNumber(trade.price)}</td>
-        <td style="padding: 12px; text-align: right; font-weight: 600; color: ${isBuy ? '#334155' : '#10b981'};">
-          ${isBuy ? '-' : '+'}$${formatNumber(trade.total_amount)}
+        <td style="padding: 12px; font-weight: 600; color: #667eea;">${escapeHtml(trade.symbol)}</td>
+        <td style="padding: 12px; color: #334155; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${nameCell}">${nameCell}</td>
+        <td style="padding: 12px; text-align: right; font-weight: 600;">${sharesCell}</td>
+        <td style="padding: 12px; text-align: right;">${priceCell}</td>
+        <td style="padding: 12px; text-align: right; font-weight: 600; color: ${amtCol};">
+          ${amtPrefix}$${formatNumber(Math.abs(trade.total_amount))}
         </td>
         <td style="padding: 12px; text-align: right; color: #ef4444; font-size: 0.85rem;">
           ${trade.commission > 0 ? `-$${formatNumber(trade.commission)}` : '-'}
         </td>
         <td style="padding: 12px;">
           <div style="display: flex; gap: 6px;">
-            <button onclick="openEditTradeModal(${JSON.stringify(trade).replace(/"/g, '&quot;')})" 
+            <button onclick="openEditTradeModal(${JSON.stringify(trade).replace(/"/g, '&quot;')})"
                     style="padding: 4px 10px; background: #e0e7ff; border: 1px solid #c7d2fe; border-radius: 4px; color: #4f46e5; cursor: pointer; font-size: 0.8rem;">
               编辑
             </button>
-            <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol}')" 
+            <button onclick="handleDeleteTrade('${trade.id}', '${trade.symbol.replace(/'/g, "\\'")}')"
                     style="padding: 4px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px; color: #ef4444; cursor: pointer; font-size: 0.8rem;">
               删除
             </button>
@@ -2353,22 +3815,20 @@ function renderTradeHistoryModal(): string {
   if (!tradeHistoryModalOpen) return '';
 
   return `
-    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
-      <div style="background: white; border-radius: 12px; width: 100%; max-width: 1000px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+    <div onmousedown="onModalBackdropMouseDown(event, 'tradeHistory')" onmouseup="onModalBackdropMouseUp(event, 'tradeHistory')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; width: 100%; max-width: min(1320px, calc(100vw - 40px)); max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
         <!-- 头部 -->
         <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
           <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">交易记录</h2>
           <div style="display: flex; gap: 8px;">
+            <button onclick="openOtherTradeModal()" style="padding: 8px 16px; border: 1px solid #c7d2fe; border-radius: 6px; background: #eef2ff; color: #4338ca; font-size: 0.85rem; cursor: pointer;">
+              ＋ 其它收支
+            </button>
             <button onclick="openImportTradeModal()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
               导入
             </button>
-            <div style="position: relative; display: inline-block;">
-              <button onclick="exportTradesToCSV()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
-                导出 CSV
-              </button>
-            </div>
-            <button onclick="exportTradesToJSON()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
-              导出 JSON
+            <button type="button" onclick="void exportTradesToXlsx()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #334155; font-size: 0.85rem; cursor: pointer;">
+              导出 xlsx
             </button>
           </div>
           <button onclick="closeTradeHistoryModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8; padding: 4px;">&times;</button>
@@ -2376,32 +3836,38 @@ function renderTradeHistoryModal(): string {
         
         <!-- 筛选区域 -->
         <div style="padding: 16px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc;">
-          <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
-            <div>
+          <div style="display: flex; gap: 12px; flex-wrap: nowrap; align-items: flex-end; overflow-x: auto;">
+            <div style="flex-shrink: 0;">
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">股票代码</label>
               <input type="text" id="trade-history-symbol-filter" value="${escapeHtmlAttr(tradeHistoryFilter.symbol)}" oninput="setTradeHistoryFilter('symbol', this.value)" placeholder="如：AAPL"
-                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; width: 120px;" />
+                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; width: 140px;" />
             </div>
-            <div>
+            <div style="flex-shrink: 0;">
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">交易类型</label>
               <select onchange="setTradeHistoryFilter('type', this.value)"
-                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; min-width: 100px;">
+                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; min-width: 110px;">
                 <option value="" ${!tradeHistoryFilter.type ? 'selected' : ''}>全部</option>
                 <option value="buy" ${tradeHistoryFilter.type === 'buy' ? 'selected' : ''}>买入</option>
                 <option value="sell" ${tradeHistoryFilter.type === 'sell' ? 'selected' : ''}>卖出</option>
+                <option value="other" ${tradeHistoryFilter.type === 'other' ? 'selected' : ''}>其它</option>
               </select>
             </div>
-            <div>
+            <div style="flex-shrink: 0;">
+              <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">其它类别</label>
+              <input type="text" id="trade-history-other-category-filter" value="${escapeHtmlAttr(tradeHistoryFilter.otherCategory)}" oninput="setTradeHistoryFilter('otherCategory', this.value)" placeholder="子串匹配"
+                     style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem; width: 130px;" />
+            </div>
+            <div style="flex-shrink: 0;">
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">开始日期</label>
               <input type="date" value="${tradeHistoryFilter.startDate}" onchange="setTradeHistoryFilter('startDate', this.value)"
                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem;" />
             </div>
-            <div>
+            <div style="flex-shrink: 0;">
               <label style="display: block; margin-bottom: 4px; color: #64748b; font-size: 0.8rem;">结束日期</label>
               <input type="date" value="${tradeHistoryFilter.endDate}" onchange="setTradeHistoryFilter('endDate', this.value)"
                      style="padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.85rem;" />
             </div>
-            <div>
+            <div style="flex-shrink: 0;">
               <button onclick="resetTradeHistoryFilter()" style="padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; cursor: pointer; font-size: 0.85rem;">
                 重置
               </button>
@@ -2409,9 +3875,137 @@ function renderTradeHistoryModal(): string {
           </div>
         </div>
         
-        <!-- 表格区域：中间滚动，底部分页条固定（股票代码筛选时仅替换本节点 innerHTML） -->
+        <!-- 表格区域：中间滚动，底部分页条固定（代码 / 其它类别输入时仅替换本节点 innerHTML） -->
         <div id="trade-history-modal-table-root" style="flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0;">
           ${buildTradeHistoryModalTableRootInnerHtml()}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function openOtherTradeModal(): void {
+  otherTradeModalOpen = true;
+  render();
+}
+
+function closeOtherTradeModal(): void {
+  otherTradeModalOpen = false;
+  render();
+}
+
+function submitOtherTradeForm(): void {
+  const catEl = document.getElementById('new-other-category') as HTMLInputElement | null;
+  const symEl = document.getElementById('new-other-symbol') as HTMLInputElement | null;
+  const nameEl = document.getElementById('new-other-name') as HTMLInputElement | null;
+  const amtEl = document.getElementById('new-other-amount') as HTMLInputElement | null;
+  const feeEl = document.getElementById('new-other-commission') as HTMLInputElement | null;
+  const dateEl = document.getElementById('new-other-date') as HTMLInputElement | null;
+
+  const cat = (catEl?.value ?? '').trim();
+  const amt = parseFloat(amtEl?.value ?? '');
+  const fee = parseFloat(feeEl?.value || '0');
+  const rawDt = (dateEl?.value ?? '').trim();
+  if (!cat) {
+    renderError('请填写类别说明');
+    return;
+  }
+  if (!Number.isFinite(amt) || amt === 0) {
+    renderError('金额须为非零数字（正数为入账，负数为扣款）');
+    return;
+  }
+  if (!Number.isFinite(fee) || fee < 0) {
+    renderError('手续费须 ≥ 0');
+    return;
+  }
+  let tradeIso: string;
+  if (!rawDt) {
+    tradeIso = new Date().toISOString();
+  } else {
+    const tradeIsoCand = parseUserEnteredTradeDatetimeToIso(rawDt);
+    const tradeAt = new Date(tradeIsoCand);
+    if (Number.isNaN(tradeAt.getTime())) {
+      renderError('时间无效');
+      return;
+    }
+    if (tradeAt.getTime() > Date.now()) {
+      renderError('时间不能晚于当前时刻');
+      return;
+    }
+    tradeIso = tradeIsoCand;
+  }
+
+  const ok = addOtherTradeRecord({
+    other_category: cat,
+    symbol: symEl?.value,
+    name: nameEl?.value,
+    total_amount: amt,
+    commission: fee,
+    trade_date: tradeIso
+  });
+  if (!ok) {
+    renderError('保存失败');
+    return;
+  }
+  loadPnlStatsOnStartup();
+  closeOtherTradeModal();
+  renderSuccess('已记入其它收支');
+  render();
+}
+
+function renderOtherTradeModal(): string {
+  if (!otherTradeModalOpen) return '';
+  const tradeDtNow = formatDatetimeLocalMinute(new Date());
+  const tradeDtMax = tradeDtNow;
+  return `
+    <div onmousedown="onModalBackdropMouseDown(event, 'otherTrade')" onmouseup="onModalBackdropMouseUp(event, 'otherTrade')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1150; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; width: 100%; max-width: 440px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25); padding: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="margin: 0; color: #334155; font-size: 1.15rem;">新增其它收支</h3>
+          <button onclick="closeOtherTradeModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
+        </div>
+        <p style="margin: 0 0 16px 0; color: #64748b; font-size: 0.82rem; line-height: 1.45;">
+          用于利息、分红、卡券等自定义项：<strong>正数毛额</strong>表示入账，<strong>负数</strong>表示扣款；不计入 FIFO 持仓，但计入<strong>现金</strong>与<strong>净盈亏</strong>（毛额减去手续费）。
+        </p>
+        <div style="margin-bottom: 14px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">类别 *</label>
+          <input type="text" id="new-other-category" placeholder="如：利息、分红、卡券抵扣…"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">关联代码（可选）</label>
+          <input type="text" id="new-other-symbol" placeholder="可与标的关联或留空（存为 OTHER）"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">备注名称（可选）</label>
+          <input type="text" id="new-other-name" placeholder="默认与类别相同"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">毛额 USD *</label>
+          <input type="number" id="new-other-amount" placeholder="± 金额" step="any"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">手续费</label>
+            <input type="number" id="new-other-commission" value="0" min="0" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">时间</label>
+            <input type="datetime-local" id="new-other-date" value="${tradeDtNow}" max="${tradeDtMax}" step="60"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+        <div style="display: flex; gap: 10px;">
+          <button type="button" onclick="closeOtherTradeModal()" style="flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-weight: 600; cursor: pointer;">
+            取消
+          </button>
+          <button type="button" onclick="submitOtherTradeForm()" style="flex: 1; padding: 12px; border: none; border-radius: 6px; background: #6366f1; color: white; font-weight: 600; cursor: pointer;">
+            保存
+          </button>
         </div>
       </div>
     </div>
@@ -2424,26 +4018,29 @@ function renderImportTradeModal(): string {
   
   const previewRows = importPreviewData.length > 0 ? importPreviewData.slice(0, 5).map(trade => {
     const date = new Date(trade.trade_date).toLocaleDateString('zh-CN');
+    const isOther = trade.type === 'other';
     const isBuy = trade.type === 'buy';
+    const label = isOther ? (trade.other_category ?? '其它') : isBuy ? '买入' : '卖出';
+    const bg = isOther ? '#6366f1' : isBuy ? '#10b981' : '#ef4444';
     return `
       <tr style="border-bottom: 1px solid #e2e8f0;">
         <td style="padding: 8px; font-size: 0.85rem; color: #64748b;">${date}</td>
         <td style="padding: 8px;">
-          <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75rem;">
-            ${isBuy ? '买入' : '卖出'}
+          <span style="background: ${bg}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75rem;">
+            ${label}
           </span>
         </td>
         <td style="padding: 8px; font-weight: 600; color: #667eea;">${trade.symbol}</td>
         <td style="padding: 8px; font-size: 0.85rem;">${trade.name}</td>
-        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">${formatNumber(trade.shares)}</td>
-        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">$${formatNumber(trade.price)}</td>
+        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">${isOther ? '—' : formatNumber(trade.shares)}</td>
+        <td style="padding: 8px; text-align: right; font-size: 0.85rem;">${isOther ? '—' : `$${formatNumber(trade.price)}`}</td>
       </tr>
     `;
   }).join('') : '';
   
   return `
-    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1200; display: flex; align-items: center; justify-content: center; padding: 20px;">
-      <div style="background: white; border-radius: 12px; width: 100%; max-width: 600px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+    <div onmousedown="onModalBackdropMouseDown(event, 'importTrade')" onmouseup="onModalBackdropMouseUp(event, 'importTrade')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1200; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; width: 100%; max-width: 600px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
         <!-- 头部 -->
         <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 24px; border-bottom: 1px solid #e2e8f0;">
           <h2 style="margin: 0; color: #334155; font-size: 1.25rem;">导入交易记录</h2>
@@ -2472,9 +4069,9 @@ function renderImportTradeModal(): string {
           </div>
           <div style="margin-bottom: 8px;">
             <label style="display: block; margin-bottom: 8px; color: #334155; font-weight: 500;">本应用导出（可选）</label>
-            <input type="file" accept=".csv,.json" onchange="handleTradeBackupImport(event)"
+            <input type="file" accept=".xlsx,.xls,.csv,.json" onchange="handleTradeBackupImport(event)"
                    style="width: 100%; padding: 12px; border: 2px dashed #e2e8f0; border-radius: 8px; background: #fafafa;" />
-            <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 0.8rem;">使用此前在应用内「导出交易」生成的 CSV 或 JSON。</p>
+            <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 0.8rem;">优先使用应用内「导出 xlsx」生成的 <strong>交易记录.xlsx</strong>；仍支持旧版 CSV / JSON。</p>
           </div>
           
           <!-- 错误提示 -->
@@ -2527,14 +4124,87 @@ function renderImportTradeModal(): string {
 // 渲染编辑交易弹窗
 function renderEditTradeModal(): string {
   if (!editTradeModalOpen || !editingTrade) return '';
-  
+
   const tradeDtForInput = formatDatetimeLocalMinute(new Date(editingTrade.trade_date));
   const editTradeDtMax = formatDatetimeLocalMinute(new Date());
+
+  if (editingTrade.type === 'other') {
+    const oc = escapeHtmlAttr(editingTrade.other_category ?? '');
+    const net = editingTrade.total_amount - editingTrade.commission;
+    const netCol = net >= 0 ? '#10b981' : '#ef4444';
+    return `
+    <div onmousedown="onModalBackdropMouseDown(event, 'editTrade')" onmouseup="onModalBackdropMouseUp(event, 'editTrade')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1100; display: flex; align-items: center; justify-content: center;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 450px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+          <h3 style="margin: 0; color: #334155;">
+            <span style="background: #6366f1; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 8px;">
+              其它
+            </span>
+            ${escapeHtml(editingTrade.other_category ?? '')}
+          </h3>
+          <button onclick="closeEditTradeModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">类别 *</label>
+          <input type="text" id="edit-other-category" value="${oc}" placeholder="如：利息、分红、卡券"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">关联代码（可选，空则 OTHER）</label>
+          <input type="text" id="edit-other-symbol" value="${escapeHtmlAttr(editingTrade.symbol)}" placeholder="留空或与某标的关联"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">备注名称</label>
+          <input type="text" id="edit-other-name" value="${escapeHtmlAttr(editingTrade.name)}"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">毛额 USD *（正=入账，负=扣款）</label>
+          <input type="number" id="edit-other-amount" value="${editingTrade.total_amount}" step="any"
+                 style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">手续费</label>
+            <input type="number" id="edit-trade-commission" value="${editingTrade.commission}" min="0" step="0.01"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+          <div>
+            <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">时间</label>
+            <input type="datetime-local" id="edit-trade-date" value="${tradeDtForInput}" max="${editTradeDtMax}" step="60"
+                   style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
+          </div>
+        </div>
+
+        <div style="padding: 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 16px; text-align: center;">
+          <span style="color: #64748b; font-size: 0.85rem;">对现金/P&amp;L 净影响: </span>
+          <span style="font-weight: 600; color: ${netCol};">${net >= 0 ? '+' : ''}$${formatNumber(net)}</span>
+        </div>
+
+        <div style="display: flex; gap: 10px;">
+          <button onclick="closeEditTradeModal()"
+                  style="flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-weight: 600; cursor: pointer;">
+            取消
+          </button>
+          <button onclick="submitEditTrade()"
+                  style="flex: 1; padding: 12px; border: none; border-radius: 6px; background: #667eea; color: white; font-weight: 600; font-size: 1rem; cursor: pointer;">
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+  }
+
   const isBuy = editingTrade.type === 'buy';
-  
+
   return `
-    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1100; display: flex; align-items: center; justify-content: center;">
-      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 450px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+    <div onmousedown="onModalBackdropMouseDown(event, 'editTrade')" onmouseup="onModalBackdropMouseUp(event, 'editTrade')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1100; display: flex; align-items: center; justify-content: center;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 450px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
           <h3 style="margin: 0; color: #334155;">
             <span style="background: ${isBuy ? '#10b981' : '#ef4444'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 8px;">
@@ -2544,13 +4214,13 @@ function renderEditTradeModal(): string {
           </h3>
           <button onclick="closeEditTradeModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
         </div>
-        
+
         <div style="margin-bottom: 16px;">
           <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股票名称</label>
-          <input type="text" value="${editingTrade.name}" readonly
+          <input type="text" value="${escapeHtmlAttr(editingTrade.name)}" readonly
                  style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; color: #334155;" />
         </div>
-        
+
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
           <div>
             <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">股数 *</label>
@@ -2563,7 +4233,7 @@ function renderEditTradeModal(): string {
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
         </div>
-        
+
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
           <div>
             <label style="display: block; margin-bottom: 6px; color: #64748b; font-size: 0.85rem;">手续费</label>
@@ -2576,20 +4246,20 @@ function renderEditTradeModal(): string {
                    style="width: 100%; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px;" />
           </div>
         </div>
-        
+
         <div id="edit-trade-amount-preview" style="padding: 12px; background: #f8fafc; border-radius: 6px; margin-bottom: 16px; text-align: center;">
           <span style="color: #64748b; font-size: 0.85rem;">金额: </span>
           <span style="font-weight: 600; color: #334155;" id="edit-trade-amount-value">
-            ${isBuy ? '-' : '+'}$${formatNumber(editingTrade.shares * editingTrade.price)}
+            ${isBuy ? '-' : '+'}$${formatNumber(editingTrade.shares * editingTrade.price * (isOptionSymbol(editingTrade.symbol) ? 100 : 1))}
           </span>
         </div>
-        
+
         <div style="display: flex; gap: 10px;">
-          <button onclick="closeEditTradeModal()" 
+          <button onclick="closeEditTradeModal()"
                   style="flex: 1; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: white; color: #64748b; font-weight: 600; cursor: pointer;">
             取消
           </button>
-          <button onclick="submitEditTrade()" 
+          <button onclick="submitEditTrade()"
                   style="flex: 1; padding: 12px; border: none; border-radius: 6px; background: #667eea; color: white; font-weight: 600; font-size: 1rem; cursor: pointer;">
             保存修改
           </button>
@@ -2626,8 +4296,8 @@ function renderTradeForm(): string {
         </div>`;
 
   return `
-    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
-      <div style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); overflow: visible;">
+    <div onmousedown="onModalBackdropMouseDown(event, 'tradeForm')" onmouseup="onModalBackdropMouseUp(event, 'tradeForm')" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+      <div onclick="event.stopPropagation()" style="background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); overflow: visible;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
           <h3 style="margin: 0; color: #334155;">${headTitle}</h3>
           <button onclick="closeTradeForm()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer; color: #94a3b8;">&times;</button>
@@ -2839,6 +4509,9 @@ function renderHoldingsTableBody(): string {
               <button type="button" class="btn btn-sell holdings-action-btn" title="记录卖出" aria-label="记录卖出"
                       onclick="openTradeForm('${symEsc}', '${escapeHtml(stock.name).replace(/'/g, "\\'")}', 'sell')"
                       style="background: #ef4444; color: white; border: none;">卖</button>
+              <button type="button" class="btn holdings-action-btn" title="查看该标的最近交易记录" aria-label="查看该标的交易记录"
+                      onclick="openTradeHistoryModalForSymbol('${symEsc}')"
+                      style="background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe;">记录</button>
             </div>
           </td>`
               : `<td class="holdings-actions-cell ${holdingsCellClass('actions')}">${HOLDINGS_DATA_MASK_HTML}</td>`
@@ -3227,6 +4900,8 @@ function render(): void {
         <!-- 交易历史记录弹窗 -->
         ${renderTradeHistoryModal()}
         
+        ${renderOtherTradeModal()}
+        
         <!-- 导入交易弹窗 -->
         ${renderImportTradeModal()}
         
@@ -3245,6 +4920,7 @@ function render(): void {
   // 每次渲染后重新设置下拉搜索事件
   setupStockSearchEvents();
   setupTradeFormSymbolSearchEvents();
+  setupPnlLineChartInteractions();
 }
 
 // 初始化应用（本地持久化）
@@ -3295,7 +4971,20 @@ void init();
 (window as any).setPnlQueryStartDate = setPnlQueryStartDate;
 (window as any).setPnlQueryEndDate = setPnlQueryEndDate;
 (window as any).resetPnlQuery = resetPnlQuery;
+(window as any).setPnlVizMode = setPnlVizMode;
+(window as any).shiftPnlCalendarMonth = shiftPnlCalendarMonth;
+(window as any).resetPnlCalendarMonth = resetPnlCalendarMonth;
+(window as any).setPnlCalendarYmFromDom = setPnlCalendarYmFromDom;
+(window as any).setPnlCalendarYearFocusOnlyFromDom = setPnlCalendarYearFocusOnlyFromDom;
+(window as any).setPnlCalendarYmSelect = setPnlCalendarYmSelect;
+(window as any).setPnlCalendarYearFocusSelect = setPnlCalendarYearFocusSelect;
+(window as any).setPnlCalendarGranularity = setPnlCalendarGranularity;
+(window as any).shiftPnlCalendarYearFocus = shiftPnlCalendarYearFocus;
+(window as any).resetPnlLineChartViewport = resetPnlLineChartViewport;
 (window as any).openTradeHistoryModal = openTradeHistoryModal;
+(window as any).openTradeHistoryModalForSymbol = openTradeHistoryModalForSymbol;
+(window as any).openTradeHistoryModalForCalendarDay = openTradeHistoryModalForCalendarDay;
+(window as any).openTradeHistoryModalForCalendarMonth = openTradeHistoryModalForCalendarMonth;
 (window as any).closeTradeHistoryModal = closeTradeHistoryModal;
 (window as any).setTradeHistoryFilter = setTradeHistoryFilter;
 (window as any).resetTradeHistoryFilter = resetTradeHistoryFilter;
@@ -3304,8 +4993,12 @@ void init();
 (window as any).openEditTradeModal = openEditTradeModal;
 (window as any).closeEditTradeModal = closeEditTradeModal;
 (window as any).submitEditTrade = submitEditTrade;
-(window as any).exportTradesToCSV = exportTradesToCSV;
-(window as any).exportTradesToJSON = exportTradesToJSON;
+(window as any).exportTradesToXlsx = exportTradesToXlsx;
+(window as any).onModalBackdropMouseDown = onModalBackdropMouseDown;
+(window as any).onModalBackdropMouseUp = onModalBackdropMouseUp;
+(window as any).openOtherTradeModal = openOtherTradeModal;
+(window as any).closeOtherTradeModal = closeOtherTradeModal;
+(window as any).submitOtherTradeForm = submitOtherTradeForm;
 (window as any).openImportTradeModal = openImportTradeModal;
 (window as any).closeImportTradeModal = closeImportTradeModal;
 (window as any).handleMoomooTradeImport = handleMoomooTradeImport;

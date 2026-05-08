@@ -6,14 +6,19 @@
  *
  * - **BBAE 导入**（xlsx）：多工作表 — 股票表（股票代码、已成、成交价…）；期权表（期权代码、费用组合列等）。
  *
- * - **本应用 CSV**（parseTradeImportLegacyCsv）：时间、类型、代码… 导出格式。
+/**
+ * - **本应用 xlsx**：`交易记录` 工作表或与 CSV 同款表头的首个工作表（见 `parseAppTradeBackupXlsxArrayBuffer`）。
+ *
+ * - **本应用 CSV/JSON（旧备份）**：`parseTradeImportLegacyCsv`、`parseJSON`（main）仍可读。
  */
 
 export interface TradeImportRecord {
   id: string;
   symbol: string;
   name: string;
-  type: 'buy' | 'sell';
+  type: 'buy' | 'sell' | 'other';
+  /** 仅 type=other */
+  other_category?: string;
   shares: number;
   price: number;
   total_amount: number;
@@ -109,29 +114,72 @@ function parseQtyNumber(s: string): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
+/** Excel 序列日（可含小数表示时刻），转 ISO；范围外返回 null */
+function isoFromExcelSerial(serial: number): string | null {
+  if (!Number.isFinite(serial)) return null;
+  const whole = Math.floor(serial);
+  if (whole < 20000 || whole > 10000000) return null;
+  const epoch = Date.UTC(1899, 11, 30);
+  const ms = epoch + serial * 86400000;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 function parseTradeDateLoose(raw: string): string {
+  const fallback = (): string => new Date().toISOString();
   const str = normalizeCell(raw)
     .replace(/\s*\(美东\)\s*$/i, '')
     .replace(/\s*\(北京时间\)\s*$/i, '')
     .trim();
-  if (!str) return new Date().toISOString();
-  const d = new Date(str);
-  if (!isNaN(d.getTime())) return d.toISOString();
-  const m = str.match(
-    /(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})/
-  );
-  if (m) {
-    const dd = new Date(
-      parseInt(m[1], 10),
-      parseInt(m[2], 10) - 1,
-      parseInt(m[3], 10),
-      parseInt(m[4], 10),
-      parseInt(m[5], 10),
-      parseInt(m[6], 10)
-    );
-    if (!isNaN(dd.getTime())) return dd.toISOString();
+  if (!str) return fallback();
+
+  if (/^-?\d+(?:\.\d+)?$/.test(str)) {
+    const n = parseFloat(str);
+    const ex = isoFromExcelSerial(n);
+    if (ex) return ex;
+    if (n > 1e12 && n < 1e14) return new Date(n).toISOString();
   }
-  return new Date().toISOString();
+
+  const trimmed = str.trim();
+
+  /** 无前缀时区的日历串：必须用本地年月日时分解析，早于 `Date.parse`。否则形如 `2026/2/2 5:35:00` 在多数环境下会被当成 UTC，东八区会显示成 13:35。 */
+  const hasExplicitZone = /(?:[Zz]|[+-]\d{2}:?\d{2}(?::\d{2})?)\s*$/.test(trimmed);
+
+  if (!hasExplicitZone) {
+    /** `[\sT]+` 必须至少吞下「空格或 T」，避免 `T?` 在 T 前卫宽度匹配而把 `T` 留给 `\d`，导致整条失效后落到 UTC 语义。 */
+    const localCal = trimmed.match(
+      /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+    );
+    if (localCal) {
+      const y = parseInt(localCal[1], 10);
+      const mo = parseInt(localCal[2], 10) - 1;
+      const day = parseInt(localCal[3], 10);
+      const hh = localCal[4] !== undefined ? parseInt(localCal[4], 10) : 0;
+      const mm = localCal[5] !== undefined ? parseInt(localCal[5], 10) : 0;
+      const ss = localCal[6] !== undefined ? parseInt(localCal[6], 10) : 0;
+      const dl = new Date(y, mo, day, hh, mm, ss);
+      if (!Number.isNaN(dl.getTime())) return dl.toISOString();
+    }
+  }
+
+  const d = new Date(trimmed);
+  if (!Number.isNaN(d.getTime())) return d.toISOString();
+
+  return fallback();
+}
+
+/** 导入用：兼容 ISO、本地化字符串、Excel 序列数、毫秒时间戳；无效则退回当前时刻 */
+export function parseImportedTradeDatetime(raw: unknown): string {
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw.toISOString();
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const ex = isoFromExcelSerial(raw);
+    if (ex) return ex;
+    if (raw > 1e12 && raw < 1e14) return new Date(raw).toISOString();
+    return parseTradeDateLoose(String(raw));
+  }
+  const s = raw === null || raw === undefined ? '' : String(raw).trim();
+  if (!s) return new Date().toISOString();
+  return parseTradeDateLoose(s);
 }
 
 function makeId(row: number): string {
@@ -259,14 +307,86 @@ function parseMoomooHistoryRows(rows: string[][]): TradeImportRecord[] {
   return out;
 }
 
-function parseLegacyCsvRows(rows: string[][]): TradeImportRecord[] {
+/** 与本应用导出 xlsx/csv 表头一致的表格（通常为首个工作表；含扩展列「其它类别」或旧版 8 列） */
+export function parseAppTradeBackupSheetRows(rows: string[][]): TradeImportRecord[] {
   if (rows.length < 2) return [];
   const out: TradeImportRecord[] = [];
   const now = new Date().toISOString();
+  const hdr = rows[0].map(normalizeCell);
+  const extFormat = hdr.includes('其它类别');
 
   for (let r = 1; r < rows.length; r++) {
     const cells = rows[r];
     if (cells.length < 6) continue;
+
+    if (extFormat) {
+      if (cells.length < 8) continue;
+      const typeRaw = normalizeCell(cells[1] ?? '');
+      const otherCat = normalizeCell(cells[2] ?? '');
+      const symbol = normalizeCell(cells[3] ?? '');
+      if (!symbol) continue;
+
+      if (typeRaw === '其它' || typeRaw.toLowerCase() === 'other') {
+        const cat = otherCat || symbol;
+        const total = parseMoneyNumber(cells[7] ?? '');
+        if (!cat || !Number.isFinite(total) || total === 0) continue;
+        let commission = 0;
+        if (cells.length > 8) {
+          const c = parseMoneyNumber(cells[8] ?? '');
+          if (Number.isFinite(c) && c >= 0) commission = c;
+        }
+        const trade_date = parseTradeDateLoose(cells[0] ?? '');
+        const symU = symbol.toUpperCase() || 'OTHER';
+        const nm = normalizeCell(cells[4] ?? '') || cat;
+        out.push({
+          id: makeId(r),
+          symbol: symU,
+          name: nm,
+          type: 'other',
+          other_category: cat,
+          shares: 1,
+          price: 0,
+          total_amount: total,
+          commission,
+          trade_date,
+          created_at: now
+        });
+        continue;
+      }
+
+      const symU = symbol.toUpperCase();
+      const isOpt = isCompactOptionSymbol(symU);
+      const type =
+        typeRaw === '买入' || typeRaw.toLowerCase() === 'buy' ? ('buy' as const) : ('sell' as const);
+      const shares = parseQtyNumber(cells[5] ?? '');
+      const price = parseMoneyNumber(cells[6] ?? '');
+      if (!(shares > 0) || !(price > 0)) continue;
+      const name = normalizeCell(cells[4] ?? '') || symbol;
+      let total = cells.length > 7 ? parseMoneyNumber(cells[7] ?? '') : NaN;
+      if (!Number.isFinite(total) || total <= 0) {
+        total = isOpt ? optionNotionalUsd(shares, price) : shares * price;
+      }
+      let commission = 0;
+      if (cells.length > 8) {
+        const c = parseMoneyNumber(cells[8] ?? '');
+        if (Number.isFinite(c) && c >= 0) commission = c;
+      }
+      const trade_date = parseTradeDateLoose(cells[0] ?? '');
+      out.push({
+        id: makeId(r),
+        symbol: symU,
+        name,
+        type,
+        shares,
+        price,
+        total_amount: total,
+        commission,
+        trade_date,
+        created_at: now
+      });
+      continue;
+    }
+
     const symbol = normalizeCell(cells[2] ?? '');
     if (!symbol) continue;
     const typeRaw = normalizeCell(cells[1] ?? '');
@@ -302,6 +422,10 @@ function parseLegacyCsvRows(rows: string[][]): TradeImportRecord[] {
     });
   }
   return out;
+}
+
+function parseLegacyCsvRows(rows: string[][]): TradeImportRecord[] {
+  return parseAppTradeBackupSheetRows(rows);
 }
 
 /** 股票订单表（xlsx 股票 sheet 或另存 CSV 时的备用） */
@@ -441,6 +565,9 @@ export function parseTradeImportLegacyCsv(content: string): TradeImportRecord[] 
   return legacy;
 }
 
+/** 与本应用「导出交易」xlsx 内工作表名一致 */
+export const TRADE_RECORD_EXPORT_SHEET_NAME = '交易记录';
+
 function sheetToRows(sheet: import('xlsx').WorkSheet, XLSX: typeof import('xlsx')): string[][] {
   const rowsUnknown = XLSX.utils.sheet_to_json(sheet, {
     header: 1,
@@ -453,6 +580,22 @@ function sheetToRows(sheet: import('xlsx').WorkSheet, XLSX: typeof import('xlsx'
       c === null || c === undefined ? '' : String(c).trim()
     )
   ) as string[][];
+}
+
+/** 本应用导出的交易备份 xlsx（优先读「交易记录」表，否则首张表） */
+export async function parseAppTradeBackupXlsxArrayBuffer(
+  buf: ArrayBuffer
+): Promise<TradeImportRecord[]> {
+  const XLSX = await import('xlsx');
+  const wb = XLSX.read(buf, { type: 'array' });
+  if (wb.SheetNames.length === 0) return [];
+  const name = wb.SheetNames.includes(TRADE_RECORD_EXPORT_SHEET_NAME)
+    ? TRADE_RECORD_EXPORT_SHEET_NAME
+    : wb.SheetNames[0];
+  const sheet = wb.Sheets[name];
+  if (!sheet) return [];
+  const rows = sheetToRows(sheet, XLSX);
+  return parseAppTradeBackupSheetRows(rows);
 }
 
 /** Moomoo：历史/现金账户 xlsx（可含多表，凡表头符合则解析合并） */
