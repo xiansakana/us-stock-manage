@@ -123,6 +123,90 @@ export function computeProfitLoss(
   };
 }
 
+/** 单笔标的在筛选区间内的买卖汇总（FIFO 已实现毛额与扣费后净盈亏） */
+export interface SymbolTradePnlSummary {
+  symbol: string;
+  totalBuyAmount: number;
+  totalSellAmount: number;
+  /** 该标的每笔买卖记录的 commission 之和 */
+  totalCommission: number;
+  /** FIFO 已实现盈亏（毛额，与全市场 computeProfitLoss 算法一致） */
+  fifoRealizedGross: number;
+  /** 盈亏金额 = fifoRealizedGross − totalCommission */
+  netPnl: number;
+}
+
+/**
+ * 按标的汇总买卖金额、费用与 FIFO 已实现盈亏。
+ * 仅统计 type 为 buy/sell 且代码非空的记录；可选日期区间与 computeProfitLoss 窗口一致。
+ */
+export function computeSymbolTradePnlSummaries(
+  trades: readonly TradeLike[],
+  options?: { startDate?: string; endDate?: string }
+): SymbolTradePnlSummary[] {
+  const windowTrades = filterTradesForWindow(trades, options).filter(
+    (t) => (t.type === 'buy' || t.type === 'sell') && t.symbol.trim() !== ''
+  );
+
+  const bySym = new Map<string, TradeLike[]>();
+  for (const t of windowTrades) {
+    const sym = t.symbol.trim().toUpperCase();
+    if (!bySym.has(sym)) bySym.set(sym, []);
+    bySym.get(sym)!.push(t);
+  }
+
+  const out: SymbolTradePnlSummary[] = [];
+
+  for (const [symbol, symTrades] of bySym) {
+    symTrades.sort((a, b) => {
+      const ta = tradeTime(a.trade_date);
+      const tb = tradeTime(b.trade_date);
+      if (ta !== tb) return ta - tb;
+      return a.id.localeCompare(b.id);
+    });
+
+    let totalBuyAmount = 0;
+    let totalSellAmount = 0;
+    let totalCommission = 0;
+    for (const trade of symTrades) {
+      totalCommission += trade.commission;
+      if (trade.type === 'buy') {
+        totalBuyAmount += trade.total_amount;
+      } else {
+        totalSellAmount += trade.total_amount;
+      }
+    }
+
+    const buyQueue: Array<{ shares: number; price: number }> = [];
+    let fifoRealizedGross = 0;
+    for (const trade of symTrades) {
+      if (trade.type === 'buy') {
+        buyQueue.push({ shares: trade.shares, price: trade.price });
+      } else if (trade.type === 'sell') {
+        fifoRealizedGross += applyFifoSellToQueue(
+          buyQueue,
+          trade.shares,
+          trade.price,
+          trade.symbol.trim()
+        );
+      }
+    }
+
+    const netPnl = fifoRealizedGross - totalCommission;
+    out.push({
+      symbol,
+      totalBuyAmount,
+      totalSellAmount,
+      totalCommission,
+      fifoRealizedGross,
+      netPnl
+    });
+  }
+
+  out.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  return out;
+}
+
 /** 剩余持仓一笔买入层（与 CostLot 一致：costPerShare = 单价） */
 export interface DerivedLot {
   shares: number;
