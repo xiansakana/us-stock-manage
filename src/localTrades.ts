@@ -134,6 +134,8 @@ export interface SymbolTradePnlSummary {
   fifoRealizedGross: number;
   /** 盈亏金额 = fifoRealizedGross − totalCommission */
   netPnl: number;
+  /** 盈亏比例 = netPnl / totalBuyAmount（%），totalBuyAmount=0 时为 null */
+  netPnlRate: number | null;
 }
 
 function tradeCalendarDateKey(trade: TradeLike): string | null {
@@ -236,13 +238,15 @@ export function computeSymbolTradePnlSummaries(
     }
 
     const netPnl = fifoRealizedGross - totalCommission;
+    const netPnlRate = totalBuyAmount !== 0 ? (netPnl / totalBuyAmount) * 100 : null;
     out.push({
       symbol,
       totalBuyAmount,
       totalSellAmount,
       totalCommission,
       fifoRealizedGross,
-      netPnl
+      netPnl,
+      netPnlRate
     });
   }
 
