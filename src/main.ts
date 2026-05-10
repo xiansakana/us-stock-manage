@@ -153,7 +153,7 @@ const TRADE_HISTORY_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
 /** 交易记录弹窗：明细列表 / 标的盈亏汇总 */
 let tradeHistoryModalTab: 'list' | 'summary' = 'list';
 /** 盈亏汇总表格排序 */
-type TradeHistorySymbolPnlSortKey = 'symbol' | 'totalBuy' | 'totalSell' | 'netPnl';
+type TradeHistorySymbolPnlSortKey = 'symbol' | 'totalBuy' | 'totalSell' | 'netPnl' | 'netPnlRate';
 let tradeHistorySymbolPnlSortKey: TradeHistorySymbolPnlSortKey = 'symbol';
 /** 1 升序，-1 降序（代码 A→Z / 金额小→大 为升序） */
 let tradeHistorySymbolPnlSortDir: 1 | -1 = 1;
@@ -3670,6 +3670,12 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
       case 'netPnl':
         cmp = a.netPnl - b.netPnl;
         break;
+      case 'netPnlRate': {
+        const aVal = a.netPnlRate ?? -Infinity;
+        const bVal = b.netPnlRate ?? -Infinity;
+        cmp = aVal - bVal;
+        break;
+      }
       default:
         cmp = 0;
     }
@@ -3687,6 +3693,7 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
     sumComm += r.totalCommission;
     sumNet += r.netPnl;
   }
+  const sumRate = sumBuy !== 0 ? (sumNet / sumBuy) * 100 : null;
 
   const rangeLabel =
     tradeHistoryFilter.startDate && tradeHistoryFilter.endDate
@@ -3701,7 +3708,7 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
     rows.length === 0
       ? `
     <tr>
-      <td colspan="5" style="padding: 40px; text-align: center; color: #94a3b8;">
+      <td colspan="6" style="padding: 40px; text-align: center; color: #94a3b8;">
         暂无买卖记录
       </td>
     </tr>
@@ -3711,6 +3718,9 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
             const netColor = r.netPnl >= 0 ? '#10b981' : '#ef4444';
             const netSign = r.netPnl >= 0 ? '+' : '-';
             const symArg = JSON.stringify(r.symbol);
+            const pnlRateDisplay = r.netPnlRate !== null
+              ? `<span style="color: ${netColor}; font-size: 0.8rem;">${netSign}${r.netPnlRate.toFixed(2)}%</span>`
+              : '—';
             return `
       <tr style="border-bottom: 1px solid #e2e8f0;">
         <td style="padding: 12px;">
@@ -3727,6 +3737,7 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
         <td style="padding: 12px; text-align: right; font-weight: 600; color: ${netColor};">
           ${netSign}$${formatNumber(Math.abs(r.netPnl))}
         </td>
+        <td style="padding: 12px; text-align: right;">${pnlRateDisplay}</td>
       </tr>
     `;
           })
@@ -3745,6 +3756,9 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
         </td>
         <td style="padding: 12px; text-align: right; color: ${sumNet >= 0 ? '#10b981' : '#ef4444'};">
           ${sumNet >= 0 ? '+' : '-'}$${formatNumber(Math.abs(sumNet))}
+        </td>
+        <td style="padding: 12px; text-align: right; color: ${sumNet >= 0 ? '#10b981' : '#ef4444'};">
+          ${sumRate !== null ? `${sumNet >= 0 ? '+' : ''}${sumRate.toFixed(2)}%` : '—'}
         </td>
       </tr>
     `;
@@ -3769,6 +3783,7 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
                 ${thSortable('totalSell', '总卖出金额')}
                 <th style="padding: 10px 12px; text-align: right; font-size: 0.8rem; color: #64748b; font-weight: 600; background: #ffffff;">总费用</th>
                 ${thSortable('netPnl', '盈亏金额', 'FIFO 已实现 − 本标的买卖手续费')}
+                ${thSortable('netPnlRate', '盈亏比例', '盈亏金额 / 总买入金额')}
               </tr>
             </thead>
             <tbody>
