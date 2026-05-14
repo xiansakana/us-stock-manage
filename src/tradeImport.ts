@@ -138,6 +138,20 @@ function parseTradeDateLoose(raw: string): string {
     const ex = isoFromExcelSerial(n);
     if (ex) return ex;
     if (n > 1e12 && n < 1e14) return new Date(n).toISOString();
+    // YYYYMMDDHHmmss / YYYYMMDDHHmm 等纯数字格式
+    if (/^\d{8,14}$/.test(str)) {
+      const yyyymmddLen = 8;
+      const y = parseInt(str.slice(0, 4), 10);
+      const mo = parseInt(str.slice(4, 6), 10) - 1;
+      const day = parseInt(str.slice(6, 8), 10);
+      const hh = str.length >= 10 ? parseInt(str.slice(8, 10), 10) : 0;
+      const mm = str.length >= 12 ? parseInt(str.slice(10, 12), 10) : 0;
+      const ss = str.length >= 14 ? parseInt(str.slice(12, 14), 10) : 0;
+      if (y >= 1970 && y <= 2100 && mo >= 0 && mo <= 11 && day >= 1 && day <= 31) {
+        const dl = new Date(y, mo, day, hh, mm, ss);
+        if (!Number.isNaN(dl.getTime())) return dl.toISOString();
+      }
+    }
   }
 
   const trimmed = str.trim();
