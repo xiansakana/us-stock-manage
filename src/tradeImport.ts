@@ -137,10 +137,8 @@ function parseTradeDateLoose(raw: string): string {
     const n = parseFloat(str);
     const ex = isoFromExcelSerial(n);
     if (ex) return ex;
-    if (n > 1e12 && n < 1e14) return new Date(n).toISOString();
-    // YYYYMMDDHHmmss / YYYYMMDDHHmm 等纯数字格式
+    // YYYYMMDDHHmmss / YYYYMMDDHHmm 等纯数字格式（优先于时间戳判断，避免 20260514211450 被误作毫秒时间戳）
     if (/^\d{8,14}$/.test(str)) {
-      const yyyymmddLen = 8;
       const y = parseInt(str.slice(0, 4), 10);
       const mo = parseInt(str.slice(4, 6), 10) - 1;
       const day = parseInt(str.slice(6, 8), 10);
@@ -155,6 +153,7 @@ function parseTradeDateLoose(raw: string): string {
         }
       }
     }
+    if (n > 1e12 && n < 1e14) return new Date(n).toISOString();
   }
 
   const trimmed = str.trim();
