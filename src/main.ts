@@ -266,6 +266,11 @@ function holdingsCellClass(key: HoldingsColumnKey): string {
   return `col-h-${HOLDINGS_COL_SUFFIX[key]}`;
 }
 
+/** 安全计算金额，避免浮点数精度问题（如 0.1 * 0.2 = 0.30000000000000004） */
+function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 function loadColumnVisibility(): Record<HoldingsColumnKey, boolean> {
   const defaults = (): Record<HoldingsColumnKey, boolean> => {
     const o = {} as Record<HoldingsColumnKey, boolean>;
@@ -484,7 +489,7 @@ function migratePortfolioStocksToTradesIfNeeded(): void {
       type: 'buy',
       shares,
       price,
-      total_amount: shares * price * optMult,
+      total_amount: roundMoney(shares * price * optMult),
       commission: 0,
       trade_date: new Date().toISOString(),
       created_at: new Date().toISOString()
@@ -1372,7 +1377,7 @@ function parseTradesFromLocalStorage(raw: string | null): TradeRecord[] {
         total_amount:
           Number.isFinite(totalRaw) && totalRaw > 0
             ? totalRaw
-            : shares * price * (isOptionSymbol(symbol) ? 100 : 1),
+            : roundMoney(shares * price * (isOptionSymbol(symbol) ? 100 : 1)),
         commission: Number.isFinite(commissionRaw) ? commissionRaw : 0,
         trade_date: String(o.trade_date ?? new Date().toISOString()),
         created_at: String(o.created_at ?? new Date().toISOString())
@@ -1393,11 +1398,11 @@ function loadPersistedTrades(): void {
 
 /** 单笔交易对现金的净变动：买入付出本金+手续费；卖出/其它为毛额−手续费（其它毛额可正可负） */
 function cashDeltaForTrade(trade: Pick<TradeRecord, 'type' | 'total_amount' | 'commission'>): number {
-  const fee = Number(trade.commission) || 0;
-  const notional = trade.total_amount;
-  if (trade.type === 'buy') return -(notional + fee);
-  if (trade.type === 'sell') return notional - fee;
-  return notional - fee;
+  const fee = Math.round((Number(trade.commission) || 0) * 100) / 100;
+  const notional = Math.round(trade.total_amount * 100) / 100;
+  if (trade.type === 'buy') return roundMoney(-(notional + fee));
+  if (trade.type === 'sell') return roundMoney(notional - fee);
+  return roundMoney(notional - fee);
 }
 
 function addTradeRecord(trade: {
@@ -1413,7 +1418,7 @@ function addTradeRecord(trade: {
   const price = trade.price;
   if (shares <= 0 || price <= 0) return false;
   const optMult = isOptionSymbol(trade.symbol) ? 100 : 1;
-  const total_amount = shares * price * optMult;
+  const total_amount = roundMoney(shares * price * optMult);
   const row: TradeRecord = {
     id: crypto.randomUUID(),
     symbol: trade.symbol.trim().toUpperCase(),
@@ -1552,7 +1557,7 @@ function updateTradeRecord(
   if (updates.trade_date !== undefined) {
     t.trade_date = updates.trade_date;
   }
-  t.total_amount = t.shares * t.price * (isOptionSymbol(t.symbol) ? 100 : 1);
+  t.total_amount = roundMoney(t.shares * t.price * (isOptionSymbol(t.symbol) ? 100 : 1));
   state.cash += cashDeltaForTrade(t) - cashDeltaForTrade(oldSnap);
   sortTradesByDateDesc(state.trades);
   flushPersistToLocal();
@@ -1754,7 +1759,7 @@ function parseJSON(content: string): TradeRecord[] {
     const symbolU = String(record.symbol ?? record.code ?? '').toUpperCase();
     let totalAmt = parseFloat(String(record.total_amount ?? record.amount ?? ''));
     if (!Number.isFinite(totalAmt) || totalAmt <= 0) {
-      totalAmt = shares * price * (isOptionSymbol(symbolU) ? 100 : 1);
+      totalAmt = roundMoney(shares * price * (isOptionSymbol(symbolU) ? 100 : 1));
     }
 
     return {
@@ -1828,7 +1833,7 @@ function confirmImportTrades(): void {
     }
     const optMult = isOptionSymbol(trade.symbol) ? 100 : 1;
     const total =
-      trade.total_amount > 0 ? trade.total_amount : shares * price * optMult;
+      trade.total_amount > 0 ? trade.total_amount : roundMoney(shares * price * optMult);
     const row: TradeRecord = {
       id: crypto.randomUUID(),
       symbol: trade.symbol.trim().toUpperCase(),
@@ -3099,7 +3104,7 @@ function normalizeImportedTrades(arr: unknown[]): TradeRecord[] {
       total_amount:
         Number.isFinite(totalRaw) && totalRaw > 0
           ? totalRaw
-          : shares * price * (isOptionSymbol(symbol) ? 100 : 1),
+          : roundMoney(shares * price * (isOptionSymbol(symbol) ? 100 : 1)),
       commission,
       trade_date: parseImportedTradeDatetime(o.trade_date),
       created_at: String(o.created_at ?? new Date().toISOString())
