@@ -149,7 +149,10 @@ function parseTradeDateLoose(raw: string): string {
       const ss = str.length >= 14 ? parseInt(str.slice(12, 14), 10) : 0;
       if (y >= 1970 && y <= 2100 && mo >= 0 && mo <= 11 && day >= 1 && day <= 31) {
         const dl = new Date(Date.UTC(y, mo, day, hh, mm, ss));
-        if (!Number.isNaN(dl.getTime())) return dl.toISOString();
+        if (!Number.isNaN(dl.getTime())) {
+          const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+          return `${dl.getUTCFullYear()}-${pad(dl.getUTCMonth() + 1)}-${pad(dl.getUTCDate())}T${pad(dl.getUTCHours())}:${pad(dl.getUTCMinutes())}:${pad(dl.getUTCSeconds())}.000`;
+        }
       }
     }
   }
@@ -171,8 +174,11 @@ function parseTradeDateLoose(raw: string): string {
       const hh = localCal[4] !== undefined ? parseInt(localCal[4], 10) : 0;
       const mm = localCal[5] !== undefined ? parseInt(localCal[5], 10) : 0;
       const ss = localCal[6] !== undefined ? parseInt(localCal[6], 10) : 0;
-      const dl = new Date(Date.UTC(y, mo, day, hh, mm, ss));
-      if (!Number.isNaN(dl.getTime())) return dl.toISOString();
+      const dl = new Date(y, mo, day, hh, mm, ss);
+      if (!Number.isNaN(dl.getTime())) {
+        const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+        return `${dl.getFullYear()}-${pad(dl.getMonth() + 1)}-${pad(dl.getDate())}T${pad(dl.getHours())}:${pad(dl.getMinutes())}:${pad(dl.getSeconds())}.000`;
+      }
     }
   }
 
