@@ -137,22 +137,6 @@ function parseTradeDateLoose(raw: string): string {
     const n = parseFloat(str);
     const ex = isoFromExcelSerial(n);
     if (ex) return ex;
-    // YYYYMMDDHHmmss / YYYYMMDDHHmm 等纯数字格式（优先于时间戳判断，避免 20260514211450 被误作毫秒时间戳）
-    if (/^\d{8,14}$/.test(str)) {
-      const y = parseInt(str.slice(0, 4), 10);
-      const mo = parseInt(str.slice(4, 6), 10) - 1;
-      const day = parseInt(str.slice(6, 8), 10);
-      const hh = str.length >= 10 ? parseInt(str.slice(8, 10), 10) : 0;
-      const mm = str.length >= 12 ? parseInt(str.slice(10, 12), 10) : 0;
-      const ss = str.length >= 14 ? parseInt(str.slice(12, 14), 10) : 0;
-      if (y >= 1970 && y <= 2100 && mo >= 0 && mo <= 11 && day >= 1 && day <= 31) {
-        const dl = new Date(Date.UTC(y, mo, day, hh, mm, ss));
-        if (!Number.isNaN(dl.getTime())) {
-          const pad = (n: number, len = 2) => String(n).padStart(len, '0');
-          return `${dl.getUTCFullYear()}-${pad(dl.getUTCMonth() + 1)}-${pad(dl.getUTCDate())}T${pad(dl.getUTCHours())}:${pad(dl.getUTCMinutes())}:${pad(dl.getUTCSeconds())}.000`;
-        }
-      }
-    }
     if (n > 1e12 && n < 1e14) return new Date(n).toISOString();
   }
 
@@ -174,10 +158,7 @@ function parseTradeDateLoose(raw: string): string {
       const mm = localCal[5] !== undefined ? parseInt(localCal[5], 10) : 0;
       const ss = localCal[6] !== undefined ? parseInt(localCal[6], 10) : 0;
       const dl = new Date(y, mo, day, hh, mm, ss);
-      if (!Number.isNaN(dl.getTime())) {
-        const pad = (n: number, len = 2) => String(n).padStart(len, '0');
-        return `${dl.getFullYear()}-${pad(dl.getMonth() + 1)}-${pad(dl.getDate())}T${pad(dl.getHours())}:${pad(dl.getMinutes())}:${pad(dl.getSeconds())}.000`;
-      }
+      if (!Number.isNaN(dl.getTime())) return dl.toISOString();
     }
   }
 
