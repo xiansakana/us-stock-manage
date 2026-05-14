@@ -1562,14 +1562,15 @@ function updateTradeRecord(
 
 // 导出交易记录为 xlsx（与本应用「本应用导出」导入一致）
 async function exportTradesToXlsx(): Promise<void> {
-  if (state.trades.length === 0) {
+  const tradesToExport = getTradeHistoryFilteredTrades();
+  if (tradesToExport.length === 0) {
     renderError('没有交易记录可导出');
     return;
   }
   try {
     const XLSX = await import('xlsx');
     const header = ['时间', '类型', '其它类别', '代码', '名称', '股数', '价格', '金额', '手续费'];
-    const dataRows: (string | number)[][] = state.trades.map((trade) => [
+    const dataRows: (string | number)[][] = tradesToExport.map((trade) => [
       new Date(trade.trade_date).toLocaleString('zh-CN'),
       trade.type === 'buy' ? '买入' : trade.type === 'sell' ? '卖出' : '其它',
       trade.type === 'other' ? (trade.other_category ?? '') : '',
