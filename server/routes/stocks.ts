@@ -13,6 +13,7 @@ interface StockData {
   price: number;
   change: number;
   changePercent: number;
+  previousClose: number;
 }
 
 // 期权数据接口
@@ -22,6 +23,7 @@ interface OptionData {
   price: number;
   change: number;
   changePercent: number;
+  previousClose: number;
   type: 'call' | 'put';
   strikePrice: number;
   expirationDate: string;
@@ -93,7 +95,8 @@ router.get('/stock/:symbol', async (req, res) => {
       name: symbol.toUpperCase(),
       price: quoteData.c,
       change: quoteData.d,
-      changePercent: quoteData.dp
+      changePercent: quoteData.dp,
+      previousClose: quoteData.pc
     };
     
     res.json(stockData);
@@ -159,6 +162,7 @@ router.get('/option/:symbol', async (req, res) => {
       price: price,
       change: change,
       changePercent: changePercent,
+      previousClose: priceData.results?.[0]?.o ?? price,
       type: contractData.results.contract_type as 'call' | 'put',
       strikePrice: contractData.results.strike_price,
       expirationDate: contractData.results.expiration_date,

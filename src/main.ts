@@ -37,6 +37,8 @@ interface Stock {
   /** 买入 / 持有 / 卖出 */
   signal?: TradeSignal;
   currentPrice: number;
+  /** 昨日收盘价（股票）或开盘价（期权）*/
+  previousClose: number;
   position: number;
   weight: number;
   type?: 'stock' | 'option'; // 股票或期权
@@ -65,6 +67,7 @@ interface StockData {
   price: number;
   change: number;
   changePercent: number;
+  previousClose: number;
 }
 
 interface AppState {
@@ -223,6 +226,8 @@ type HoldingsColumnKey =
   | 'price'
   | 'pnl'
   | 'pnlPct'
+  | 'dayPnl'
+  | 'dayPnlPct'
   | 'position'
   | 'weight'
   | 'target'
@@ -238,6 +243,8 @@ const HOLDINGS_COLUMN_META: ReadonlyArray<{ key: HoldingsColumnKey; label: strin
   { key: 'price', label: '现价' },
   { key: 'pnl', label: '盈亏' },
   { key: 'pnlPct', label: '盈亏比例' },
+  { key: 'dayPnl', label: '当日盈亏' },
+  { key: 'dayPnlPct', label: '当日盈亏比例' },
   { key: 'position', label: '持仓' },
   { key: 'weight', label: '仓位 / 占比' },
   { key: 'target', label: '1y目标价' },
@@ -254,6 +261,8 @@ const HOLDINGS_COL_SUFFIX: Record<HoldingsColumnKey, string> = {
   price: 'price',
   pnl: 'pnl',
   pnlPct: 'pnl-pct',
+  dayPnl: 'day-pnl',
+  dayPnlPct: 'day-pnl-pct',
   position: 'pos',
   weight: 'weight',
   target: 'target',
@@ -524,6 +533,7 @@ function syncStocksFromTrades(): void {
       avgCost: d.avgCost,
       costLots: d.costLots.map((lot) => ({ shares: lot.shares, costPerShare: lot.costPerShare })),
       currentPrice: prev?.currentPrice ?? 0,
+      previousClose: prev?.previousClose ?? 0,
       position: 0,
       weight: 0,
       signal: prev?.signal ?? 'hold',
@@ -632,6 +642,18 @@ function computeLinePnLPercent(stock: Stock): number | null {
   const c = stock.avgCost;
   if (c === undefined || c === null || Number.isNaN(Number(c)) || Number(c) <= 0) return null;
   return ((stock.currentPrice - Number(c)) / Number(c)) * 100;
+}
+
+/** 当日盈亏 = (现价 - 昨收/开盘) × 股数 × 合约乘数；无昨收数据返回 null */
+function computeDayPnL(stock: Stock): number | null {
+  if (!stock.previousClose || stock.previousClose <= 0) return null;
+  return (stock.currentPrice - stock.previousClose) * stock.shares * positionMultiplier(stock);
+}
+
+/** 当日盈亏比例 = (现价 − 昨收/开盘) ÷ 昨收/开盘 × 100%；无昨收数据返回 null */
+function computeDayPnLPercent(stock: Stock): number | null {
+  if (!stock.previousClose || stock.previousClose <= 0) return null;
+  return ((stock.currentPrice - stock.previousClose) / stock.previousClose) * 100;
 }
 
 function formatPnLCell(pnl: number | null): string {
@@ -1083,6 +1105,7 @@ async function refreshSingleStock(symbol: string): Promise<void> {
   try {
     let price = 0;
     let change = 0;
+    let previousClose = 0;
 
     if (stock.type === 'option' || isOptionSymbol(symbol)) {
       // 期权走 /api/option/:symbol（旧数据可能缺少 type）
@@ -1091,10 +1114,12 @@ async function refreshSingleStock(symbol: string): Promise<void> {
       const data = await response.json();
       price = (data.price as number) ?? 0;
       change = (data.change as number) ?? 0;
+      previousClose = (data.previousClose as number) ?? price;
     } else {
       const data = await fetchStockDataFromAPI(symbol);
       price = data.price;
       change = data.change;
+      previousClose = data.previousClose ?? price;
     }
 
     state.stocks = state.stocks.map(s => {
@@ -1102,6 +1127,7 @@ async function refreshSingleStock(symbol: string): Promise<void> {
         return {
           ...s,
           currentPrice: price,
+          previousClose: previousClose,
           position: s.shares * price * positionMultiplier(s)
         };
       }
@@ -1167,7 +1193,8 @@ async function fetchBatchStockData(stocks: Stock[]): Promise<StockData[]> {
         name: getStockDisplayName(stock.symbol),
         price: 0,
         change: 0,
-        changePercent: 0
+        changePercent: 0,
+        previousClose: 0
       });
     }
   }
@@ -1301,6 +1328,7 @@ function applyPortfolioFromParsed(parsed: { stocks: unknown; cash?: unknown }): 
       ...(s as unknown as Stock),
       symbol: sym,
       type: (s.type as Stock['type']) ?? (inferredOption ? 'option' : 'stock'),
+      previousClose: typeof s.previousClose === 'number' ? s.previousClose : 0,
       position: 0,
       weight: 0
     };
@@ -2941,6 +2969,7 @@ function exportToJSON(): void {
       avgCost: s.avgCost,
       signal: s.signal,
       currentPrice: s.currentPrice,
+      previousClose: s.previousClose,
       position: s.position,
       weight: s.weight,
       type: s.type,
@@ -3268,6 +3297,7 @@ function importFromCSV(event: Event): void {
                   })()
                 : undefined,
             currentPrice: parseFloat(values[6]) || 0,
+            previousClose: 0,
             position: parseFloat(values[8 + pinOff]) || 0,
             weight: 0,
             targetPrice:
@@ -3304,6 +3334,7 @@ function importFromCSV(event: Event): void {
                   })()
                 : undefined,
             currentPrice: parseFloat(values[5]) || 0,
+            previousClose: 0,
             position: parseFloat(values[7 + pinOff]) || 0,
             weight: 0,
             targetPrice:
@@ -3336,6 +3367,7 @@ function importFromCSV(event: Event): void {
                     return Number.isFinite(n) ? Math.round(n * 100) / 100 : undefined;
                   })(),
             currentPrice: parseFloat(values[4]) || 0,
+            previousClose: 0,
             position: parseFloat(values[5]) || 0,
             weight: 0,
             optionStrike: values[8] ? parseFloat(values[8]) : undefined,
@@ -4680,6 +4712,8 @@ function renderHoldingsTableBody(): string {
           }
           <td class="${holdingsCellClass('pnl')}" style="font-size: 0.9rem;">${maskOr('pnl', formatPnLCell(pnl))}</td>
           <td class="${holdingsCellClass('pnlPct')}" style="font-size: 0.9rem;">${maskOr('pnlPct', formatPnLPercentCell(computeLinePnLPercent(stock)))}</td>
+          <td class="${holdingsCellClass('dayPnl')}" style="font-size: 0.9rem;">${maskOr('dayPnl', formatPnLCell(computeDayPnL(stock)))}</td>
+          <td class="${holdingsCellClass('dayPnlPct')}" style="font-size: 0.9rem;">${maskOr('dayPnlPct', formatPnLPercentCell(computeDayPnLPercent(stock)))}</td>
           ${
             columnVisibility.position
               ? `<td class="${holdingsCellClass('position')}" style="font-weight: 600; color: #059669;" id="position-${stock.symbol}">$${formatNumber(stock.position)}</td>`
@@ -4776,6 +4810,7 @@ async function updateStockPrices(): Promise<void> {
         return {
           ...stock,
           currentPrice: data.price,
+          previousClose: data.previousClose ?? data.price,
           ...(stock.type === 'option' ? { name: data.name } : {})
         };
       }
@@ -4840,7 +4875,8 @@ async function addStock(): Promise<void> {
             name: optionData.name,
             price: optionData.price,
             change: optionData.change,
-            changePercent: optionData.changePercent
+            changePercent: optionData.changePercent,
+            previousClose: optionData.previousClose ?? 0
           };
         } else {
           // 如果期权数据获取失败，使用标的股票价格作为参考
@@ -4872,6 +4908,7 @@ async function addStock(): Promise<void> {
       avgCost: undefined,
       signal: 'hold',
       currentPrice: stockData.price || 0,
+      previousClose: stockData.previousClose ?? stockData.price ?? 0,
       position: 0,
       weight: 0,
       type: isOption ? 'option' : 'stock',
@@ -5090,6 +5127,8 @@ function render(): void {
                   <th class="${holdingsCellClass('price')}">现价</th>
                   <th class="${holdingsCellClass('pnl')}">盈亏</th>
                   <th class="${holdingsCellClass('pnlPct')}" title="(现价 − 成本) ÷ 成本">盈亏比例</th>
+                  <th class="${holdingsCellClass('dayPnl')}">当日盈亏</th>
+                  <th class="${holdingsCellClass('dayPnlPct')}" title="(现价 − 昨日收盘) ÷ 昨日收盘">当日盈亏比例</th>
                   <th class="${holdingsCellClass('position')}">持仓</th>
                   <th class="${holdingsCellClass('weight')}" style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('weight')" title="按同标的合计占总资产比例排序">
                     仓位 / 占比${tableSortKey === 'weight' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}
