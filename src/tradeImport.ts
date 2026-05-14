@@ -148,7 +148,7 @@ function parseTradeDateLoose(raw: string): string {
       const mm = str.length >= 12 ? parseInt(str.slice(10, 12), 10) : 0;
       const ss = str.length >= 14 ? parseInt(str.slice(12, 14), 10) : 0;
       if (y >= 1970 && y <= 2100 && mo >= 0 && mo <= 11 && day >= 1 && day <= 31) {
-        const dl = new Date(y, mo, day, hh, mm, ss);
+        const dl = new Date(Date.UTC(y, mo, day, hh, mm, ss));
         if (!Number.isNaN(dl.getTime())) return dl.toISOString();
       }
     }
@@ -171,7 +171,7 @@ function parseTradeDateLoose(raw: string): string {
       const hh = localCal[4] !== undefined ? parseInt(localCal[4], 10) : 0;
       const mm = localCal[5] !== undefined ? parseInt(localCal[5], 10) : 0;
       const ss = localCal[6] !== undefined ? parseInt(localCal[6], 10) : 0;
-      const dl = new Date(y, mo, day, hh, mm, ss);
+      const dl = new Date(Date.UTC(y, mo, day, hh, mm, ss));
       if (!Number.isNaN(dl.getTime())) return dl.toISOString();
     }
   }
