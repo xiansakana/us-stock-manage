@@ -47,6 +47,10 @@ interface Stock {
   instrumentType?: string;
   /** 手动拖到某一品类后，归入该主标的代码；不设则按 Finnhub/代码自动分组 */
   groupWith?: string;
+  /** 行情接口给出的当日每股涨跌额（股票为相对昨收的 d；数据源口径见表格提示）；未刷新或无效则无 */
+  quoteChangePerShare?: number;
+  /** 行情接口给出的当日涨跌幅 %（数据源口径）；未刷新或无效则无 */
+  quoteChangePercent?: number;
 }
 
 // 导出数据结构（含交易快照便于完整恢复）
@@ -223,6 +227,8 @@ type HoldingsColumnKey =
   | 'price'
   | 'pnl'
   | 'pnlPct'
+  | 'dailyPnl'
+  | 'dailyPnlPct'
   | 'position'
   | 'weight'
   | 'target'
@@ -238,6 +244,8 @@ const HOLDINGS_COLUMN_META: ReadonlyArray<{ key: HoldingsColumnKey; label: strin
   { key: 'price', label: '现价' },
   { key: 'pnl', label: '盈亏' },
   { key: 'pnlPct', label: '盈亏比例' },
+  { key: 'dailyPnl', label: '当日盈亏' },
+  { key: 'dailyPnlPct', label: '当日盈亏比例' },
   { key: 'position', label: '持仓' },
   { key: 'weight', label: '仓位 / 占比' },
   { key: 'target', label: '1y目标价' },
@@ -254,6 +262,8 @@ const HOLDINGS_COL_SUFFIX: Record<HoldingsColumnKey, string> = {
   price: 'price',
   pnl: 'pnl',
   pnlPct: 'pnl-pct',
+  dailyPnl: 'daily-pnl',
+  dailyPnlPct: 'daily-pnl-pct',
   position: 'pos',
   weight: 'weight',
   target: 'target',
@@ -533,7 +543,9 @@ function syncStocksFromTrades(): void {
       instrumentType: prev?.instrumentType,
       optionStrike: prev?.optionStrike ?? optFields?.optionStrike,
       optionExpiry: prev?.optionExpiry ?? optFields?.optionExpiry,
-      optionType: prev?.optionType ?? optFields?.optionType
+      optionType: prev?.optionType ?? optFields?.optionType,
+      quoteChangePerShare: prev?.quoteChangePerShare,
+      quoteChangePercent: prev?.quoteChangePercent
     };
   });
   calculateTotals();
@@ -632,6 +644,21 @@ function computeLinePnLPercent(stock: Stock): number | null {
   const c = stock.avgCost;
   if (c === undefined || c === null || Number.isNaN(Number(c)) || Number(c) <= 0) return null;
   return ((stock.currentPrice - Number(c)) / Number(c)) * 100;
+}
+
+/** 当日持仓盈亏（美元）＝每股当日涨跌 × 股数 × 合约乘数；未拉取当日行情或无有效涨跌时为 null */
+function computePositionDailyPnL(stock: Stock): number | null {
+  const ch = stock.quoteChangePerShare;
+  if (ch === undefined || ch === null || !Number.isFinite(ch)) return null;
+  if (!Number.isFinite(stock.shares) || stock.shares <= 0) return null;
+  return roundMoney(ch * stock.shares * positionMultiplier(stock));
+}
+
+/** 当日涨跌幅（%），取自行情接口；无有效数据时为 null */
+function computePositionDailyPnLPct(stock: Stock): number | null {
+  const p = stock.quoteChangePercent;
+  if (p === undefined || p === null || !Number.isFinite(p)) return null;
+  return p;
 }
 
 function formatPnLCell(pnl: number | null): string {
@@ -1084,6 +1111,7 @@ async function refreshSingleStock(symbol: string): Promise<void> {
     let price = 0;
     let change = 0;
 
+    let changePct: number | undefined;
     if (stock.type === 'option' || isOptionSymbol(symbol)) {
       // 期权走 /api/option/:symbol（旧数据可能缺少 type）
       const response = await fetch(`/api/option/${encodeURIComponent(symbol)}`);
@@ -1091,10 +1119,18 @@ async function refreshSingleStock(symbol: string): Promise<void> {
       const data = await response.json();
       price = (data.price as number) ?? 0;
       change = (data.change as number) ?? 0;
+      changePct =
+        typeof data.changePercent === 'number' && Number.isFinite(data.changePercent)
+          ? data.changePercent
+          : undefined;
     } else {
       const data = await fetchStockDataFromAPI(symbol);
       price = data.price;
       change = data.change;
+      changePct =
+        typeof data.changePercent === 'number' && Number.isFinite(data.changePercent)
+          ? data.changePercent
+          : undefined;
     }
 
     state.stocks = state.stocks.map(s => {
@@ -1102,7 +1138,9 @@ async function refreshSingleStock(symbol: string): Promise<void> {
         return {
           ...s,
           currentPrice: price,
-          position: s.shares * price * positionMultiplier(s)
+          position: s.shares * price * positionMultiplier(s),
+          quoteChangePerShare: Number.isFinite(change) ? change : undefined,
+          quoteChangePercent: changePct
         };
       }
       return s;
@@ -1239,6 +1277,8 @@ function buildPortfolioPayload(): {
     optionType?: 'C' | 'P';
     instrumentType?: string;
     costLots?: CostLot[];
+    quoteChangePerShare?: number;
+    quoteChangePercent?: number;
   }>;
   cash: number;
 } {
@@ -1257,7 +1297,13 @@ function buildPortfolioPayload(): {
       optionExpiry: s.optionExpiry,
       optionType: s.optionType,
       instrumentType: s.instrumentType,
-      costLots: s.costLots
+      costLots: s.costLots,
+      ...(typeof s.quoteChangePerShare === 'number' && Number.isFinite(s.quoteChangePerShare)
+        ? { quoteChangePerShare: s.quoteChangePerShare }
+        : {}),
+      ...(typeof s.quoteChangePercent === 'number' && Number.isFinite(s.quoteChangePercent)
+        ? { quoteChangePercent: s.quoteChangePercent }
+        : {})
     })),
     cash: state.cash
   };
@@ -1292,17 +1338,26 @@ function saveToStorage(): void {
   }, PERSIST_DEBOUNCE_MS);
 }
 
+function parseStoredQuoteFinite(n: unknown): number | undefined {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return undefined;
+  return n;
+}
+
 function applyPortfolioFromParsed(parsed: { stocks: unknown; cash?: unknown }): void {
   if (!Array.isArray(parsed.stocks)) return;
   state.stocks = parsed.stocks.map((s: Record<string, unknown>) => {
     const sym = String(s.symbol ?? '').toUpperCase();
     const inferredOption = isOptionSymbol(sym);
+    const qCh = parseStoredQuoteFinite(s.quoteChangePerShare);
+    const qPct = parseStoredQuoteFinite(s.quoteChangePercent);
     return {
       ...(s as unknown as Stock),
       symbol: sym,
       type: (s.type as Stock['type']) ?? (inferredOption ? 'option' : 'stock'),
       position: 0,
-      weight: 0
+      weight: 0,
+      quoteChangePerShare: qCh,
+      quoteChangePercent: qPct
     };
   });
   const c = parsed.cash;
@@ -2949,7 +3004,13 @@ function exportToJSON(): void {
       optionType: s.optionType,
       groupWith: s.groupWith,
       instrumentType: s.instrumentType,
-      costLots: s.costLots
+      costLots: s.costLots,
+      ...(typeof s.quoteChangePerShare === 'number' && Number.isFinite(s.quoteChangePerShare)
+        ? { quoteChangePerShare: s.quoteChangePerShare }
+        : {}),
+      ...(typeof s.quoteChangePercent === 'number' && Number.isFinite(s.quoteChangePercent)
+        ? { quoteChangePercent: s.quoteChangePercent }
+        : {})
     }))
   };
   
@@ -4680,6 +4741,8 @@ function renderHoldingsTableBody(): string {
           }
           <td class="${holdingsCellClass('pnl')}" style="font-size: 0.9rem;">${maskOr('pnl', formatPnLCell(pnl))}</td>
           <td class="${holdingsCellClass('pnlPct')}" style="font-size: 0.9rem;">${maskOr('pnlPct', formatPnLPercentCell(computeLinePnLPercent(stock)))}</td>
+          <td class="${holdingsCellClass('dailyPnl')}" style="font-size: 0.9rem;">${maskOr('dailyPnl', formatPnLCell(computePositionDailyPnL(stock)))}</td>
+          <td class="${holdingsCellClass('dailyPnlPct')}" style="font-size: 0.9rem;">${maskOr('dailyPnlPct', formatPnLPercentCell(computePositionDailyPnLPct(stock)))}</td>
           ${
             columnVisibility.position
               ? `<td class="${holdingsCellClass('position')}" style="font-weight: 600; color: #059669;" id="position-${stock.symbol}">$${formatNumber(stock.position)}</td>`
@@ -4740,6 +4803,8 @@ function renderHoldingsTableBody(): string {
       <td class="${holdingsCellClass('price')}" style="color: #94a3b8;">${maskOr('price', '—')}</td>
       <td class="${holdingsCellClass('pnl')}" style="color: #94a3b8;">${maskOr('pnl', '—')}</td>
       <td class="${holdingsCellClass('pnlPct')}" style="color: #94a3b8;">${maskOr('pnlPct', '—')}</td>
+      <td class="${holdingsCellClass('dailyPnl')}" style="color: #94a3b8;">${maskOr('dailyPnl', '—')}</td>
+      <td class="${holdingsCellClass('dailyPnlPct')}" style="color: #94a3b8;">${maskOr('dailyPnlPct', '—')}</td>
       <td class="${holdingsCellClass('position')}" style="font-weight: 700; color: #0f766e;">${maskOr('position', `$${formatNumber(state.cash)}`)}</td>
       <td class="${holdingsCellClass('weight')}" style="font-weight: 700; color: #4338ca;">${maskOr('weight', formatPercent(cashWeightPct))}</td>
       <td class="${holdingsCellClass('target')}" style="color: #94a3b8;">${maskOr('target', '—')}</td>
@@ -4773,9 +4838,17 @@ async function updateStockPrices(): Promise<void> {
     state.stocks = state.stocks.map(stock => {
       const data = stockDataList.find((d: any) => d.symbol === stock.symbol);
       if (data && data.price > 0) {
+        const ch =
+          typeof data.change === 'number' && Number.isFinite(data.change) ? data.change : undefined;
+        const chPct =
+          typeof data.changePercent === 'number' && Number.isFinite(data.changePercent)
+            ? data.changePercent
+            : undefined;
         return {
           ...stock,
           currentPrice: data.price,
+          quoteChangePerShare: ch,
+          quoteChangePercent: chPct,
           ...(stock.type === 'option' ? { name: data.name } : {})
         };
       }
@@ -4878,7 +4951,15 @@ async function addStock(): Promise<void> {
       optionStrike: selectedOptionData.strike,
       optionExpiry: selectedOptionData.expiry,
       optionType: selectedOptionData.type,
-      instrumentType: isOption ? undefined : pick?.instrumentType
+      instrumentType: isOption ? undefined : pick?.instrumentType,
+      quoteChangePerShare:
+        typeof stockData.change === 'number' && Number.isFinite(stockData.change)
+          ? stockData.change
+          : undefined,
+      quoteChangePercent:
+        typeof stockData.changePercent === 'number' && Number.isFinite(stockData.changePercent)
+          ? stockData.changePercent
+          : undefined
     };
 
     pendingSearchPick = null;
@@ -5072,6 +5153,8 @@ function render(): void {
                 <col class="holdings-col-price" />
                 <col class="holdings-col-pnl" />
                 <col class="holdings-col-pnl-pct" />
+                <col class="holdings-col-daily-pnl" />
+                <col class="holdings-col-daily-pnl-pct" />
                 <col class="holdings-col-pos" />
                 <col class="holdings-col-weight" />
                 <col class="holdings-col-target" />
@@ -5090,6 +5173,8 @@ function render(): void {
                   <th class="${holdingsCellClass('price')}">现价</th>
                   <th class="${holdingsCellClass('pnl')}">盈亏</th>
                   <th class="${holdingsCellClass('pnlPct')}" title="(现价 − 成本) ÷ 成本">盈亏比例</th>
+                  <th class="${holdingsCellClass('dailyPnl')}" title="行情当日每股涨跌 × 持仓；未点击刷新或未拉取时为 —">当日盈亏</th>
+                  <th class="${holdingsCellClass('dailyPnlPct')}" title="当日涨跌幅 %（Finnhub 股票为相对昨收；期权为接口返回口径）">当日盈亏比例</th>
                   <th class="${holdingsCellClass('position')}">持仓</th>
                   <th class="${holdingsCellClass('weight')}" style="cursor: pointer; user-select: none; white-space: nowrap;" onclick="setTableSort('weight')" title="按同标的合计占总资产比例排序">
                     仓位 / 占比${tableSortKey === 'weight' ? (tableSortDir === 1 ? ' ▲' : ' ▼') : ''}

@@ -206,7 +206,7 @@ table.holdings-table col.holdings-col-type {
   width: 8%;
 }
 table.holdings-table col.holdings-col-symbol {
-  width: 18%;
+  width: 11%;
 }
 table.holdings-table col.holdings-col-shares {
   width: 5%;
@@ -218,10 +218,16 @@ table.holdings-table col.holdings-col-price {
   width: 6%;
 }
 table.holdings-table col.holdings-col-pnl {
-  width: 6%;
+  width: 5%;
 }
 table.holdings-table col.holdings-col-pnl-pct {
   width: 5%;
+}
+table.holdings-table col.holdings-col-daily-pnl {
+  width: 6%;
+}
+table.holdings-table col.holdings-col-daily-pnl-pct {
+  width: 8%;
 }
 table.holdings-table col.holdings-col-pos {
   width: 7%;
@@ -248,6 +254,11 @@ table.holdings-table tbody td.col-h-type {
   white-space: nowrap;
   text-align: center;
   overflow: visible;
+}
+
+/* 当日盈亏比例表头不换行（列宽已由代码列让利） */
+table.holdings-table thead th.col-h-daily-pnl-pct {
+  white-space: nowrap;
 }
 
 /* 列数据关闭显示时，单元格内占位（列宽与表头保留） */
