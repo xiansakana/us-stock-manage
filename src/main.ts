@@ -686,6 +686,25 @@ function formatTotalPnlSummaryHtml(pnl: number): string {
   return `<span style="color:${color}; font-weight:700;">${sign}$${formatNumber(pnl)}</span>`;
 }
 
+/** 顶部当日总盈亏卡片：汇总所有持仓的当日盈亏 */
+function formatDailyTotalPnlSummaryHtml(): string {
+  let total = 0;
+  let hasData = false;
+  for (const s of state.stocks) {
+    const pnl = computePositionDailyPnL(s);
+    if (pnl !== null) {
+      total += pnl;
+      hasData = true;
+    }
+  }
+  if (!hasData) {
+    return '<span style="opacity:0.85;">—</span>';
+  }
+  const color = total >= 0 ? '#ecfdf5' : '#fecaca';
+  const sign = total >= 0 ? '+' : '';
+  return `<span style="color:${color}; font-weight:700;">${sign}$${formatNumber(total)}</span>`;
+}
+
 function formatTargetInputValue(tp: number | undefined): string {
   if (tp === undefined || tp === null || Number.isNaN(Number(tp))) return '';
   return formatNumber(Number(tp), 2);
@@ -5124,6 +5143,11 @@ function render(): void {
                     ? '未含未填成本行'
                     : '已填成本持仓合计'
               }</div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
+              <h3>当日总盈亏</h3>
+              <div class="value" style="font-size: 1.75rem;">${formatDailyTotalPnlSummaryHtml()}</div>
+              <div style="font-size: 0.72rem; opacity: 0.92; margin-top: 6px;">所有持仓当日盈亏合计</div>
             </div>
             <div class="summary-card">
               <h3>现金</h3>
