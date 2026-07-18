@@ -3738,7 +3738,14 @@ function buildTradeHistorySymbolPnlSummaryTableInnerHtml(): string {
   if (tradeHistoryFilter.startDate) rangeOpts.startDate = tradeHistoryFilter.startDate;
   if (tradeHistoryFilter.endDate) rangeOpts.endDate = tradeHistoryFilter.endDate;
 
-  const rowsRaw = computeSymbolTradePnlSummaries(state.trades, rangeOpts);
+  let rowsRaw = computeSymbolTradePnlSummaries(state.trades, rangeOpts);
+
+  // 按股票代码筛选（支持模糊匹配，与明细列表一致）
+  if (tradeHistoryFilter.symbol) {
+    const needle = tradeHistoryFilter.symbol.toUpperCase();
+    rowsRaw = rowsRaw.filter(r => r.symbol.toUpperCase().includes(needle));
+  }
+
   const dir = tradeHistorySymbolPnlSortDir;
   const key = tradeHistorySymbolPnlSortKey;
   const rows = [...rowsRaw].sort((a, b) => {
