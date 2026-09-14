@@ -2,9 +2,9 @@ import { Router } from 'express';
 
 const router = Router();
 
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || 'REMOVED_SECRET';
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || '';
 
-const POLYGON_API_KEY = process.env.POLYGON_API_KEY || 'REMOVED_SECRET';
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY || '';
 
 // 股票数据接口
 interface StockData {
